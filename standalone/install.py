@@ -1,4 +1,4 @@
-"""Install a verified Roguelike release only into an independently copied game."""
+"""Install a verified Roguelike release into the player-selected PD2 folder."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -76,9 +76,9 @@ def _walk(root: Path):
 def _no_links_in_copy(root: Path) -> None:
     for item in _walk(root):
         if _is_link(item):
-            raise ValueError(f"The game copy contains a link or junction: {item}")
+            raise ValueError(f"The selected game folder contains a link or junction: {item}")
         if item.is_file() and item.stat().st_nlink != 1:
-            raise ValueError(f"The game copy contains a hard-linked file: {item}")
+            raise ValueError(f"The selected game folder contains a hard-linked file: {item}")
 
 
 def _load_json(path: Path) -> dict:
@@ -103,31 +103,22 @@ def _same_path(left: str | Path, right: str | Path) -> bool:
     return os.path.normcase(os.path.normpath(str(left))) == os.path.normcase(os.path.normpath(str(right)))
 
 
-def _verify_native_copy_path(copy: Path) -> None:
+def _verify_native_path(copy: Path) -> None:
     # The current native route snapshot uses ANSI paths and MAX_PATH, including
     # a 15-character hero name and its temporary-file suffix.
     longest = str(copy / "ProjectD2" / ("roguelike-route-" + "A" * 15 + ".json.tmp"))
     if not longest.isascii() or len(longest) >= 260:
-        raise ValueError("Use a shorter copied-installation path containing only ASCII characters")
+        raise ValueError("Use a shorter installation path containing only ASCII characters")
 
 
-def _separate_roots(original: Path, copy: Path) -> tuple[Path, Path]:
-    original, copy = Path(original).absolute(), Path(copy).absolute()
-    _no_link_ancestors(original)
-    _no_link_ancestors(copy)
-    if not original.is_dir() or not copy.is_dir():
-        raise ValueError("Choose an existing original PD2 installation and a separate copied installation")
-    original, copy = original.resolve(strict=True), copy.resolve(strict=True)
-    if os.path.samefile(original, copy):
-        raise ValueError("The copied installation must not be the original installation")
-    try:
-        common = os.path.normcase(os.path.commonpath((original, copy)))
-    except ValueError:  # Different Windows volumes cannot contain one another.
-        common = ""
-    if common in (os.path.normcase(str(original)), os.path.normcase(str(copy))):
-        raise ValueError("The original and copied installations must not contain each other")
-    _verify_native_copy_path(copy)
-    return original, copy
+def _selected_root(folder: Path) -> Path:
+    folder = Path(folder).absolute()
+    _no_link_ancestors(folder)
+    if not folder.is_dir():
+        raise ValueError("Choose an existing PD2 installation folder")
+    folder = folder.resolve(strict=True)
+    _verify_native_path(folder)
+    return folder
 
 
 def _verify_images(project: Path) -> None:
@@ -135,7 +126,7 @@ def _verify_images(project: Path) -> None:
         path = project / name
         _no_link_ancestors(path)
         if not path.is_file() or _hash(path) != expected:
-            raise ValueError(f"This is not the supported PD2 S13 patch #2 copy: {name}")
+            raise ValueError(f"This is not the supported PD2 S13 patch #2 installation: {name}")
 
 
 def _game_process_paths() -> list[str]:
@@ -172,7 +163,7 @@ def _check_data(root: Path, records: list[dict]) -> None:
         relative = path[5:]
         target = root / relative
         if target.resolve(strict=False).is_relative_to(root.resolve(strict=True)) is False:
-            raise ValueError("Installed data inventory escapes the game copy")
+            raise ValueError("Installed data inventory escapes the selected game folder")
         if relative.casefold() in expected:
             raise ValueError("Installed data inventory contains duplicate paths")
         expected[relative.casefold()] = record
@@ -197,46 +188,46 @@ def _check_data(root: Path, records: list[dict]) -> None:
         raise ValueError("Installed mod data contains unowned files; preserve and inspect them before updating")
 
 
-def inspect(original: Path, copy: Path) -> dict:
-    """Validate both roots and return state; never modify the game or saves."""
-    original, copy = _separate_roots(original, copy)
-    _no_links_in_copy(copy)
-    original_project, project = original / "ProjectD2", copy / "ProjectD2"
+def _check_owner(meta: Path, folder: Path) -> None:
+    owner = _load_json(meta / _OWNER)
+    if (owner.get("schema_version") != 1 or not isinstance(owner.get("copy"), str)
+            or not _same_path(owner["copy"], folder)):
+        raise ValueError("Launcher metadata belongs to a different game folder")
+
+
+def inspect(folder: Path) -> dict:
+    """Validate the selected game folder and return its installed state."""
+    folder = _selected_root(folder)
+    _no_links_in_copy(folder)
+    project = folder / "ProjectD2"
     _verify_images(project)
-    if _hash(original_project / "Game.exe") != _IMAGES["Game.exe"]:
-        raise ValueError("The selected original is not the supported PD2 installation")
-    original_config = _load_json(original_project / "ProjectDiablo.json")
-    if not _same_path(_configured_path(original_config, "installpath"), original):
-        raise ValueError("The selected original's PD2 install path does not identify that folder")
     config = _load_json(project / "ProjectDiablo.json")
-    meta = copy / _METADATA
+    meta = folder / _METADATA
     receipt = meta / _RECEIPT
     if (meta / _PENDING).exists():
         raise RuntimeError("A previous update needs recovery before continuing")
     if meta.exists():
-        owner = _load_json(meta / _OWNER)
-        if (owner != {"schema_version": 1, "original": str(original), "copy": str(copy)}):
-            raise ValueError("Launcher metadata belongs to different game folders")
+        _check_owner(meta, folder)
     if receipt.is_file():
         state = _load_json(receipt)
-        if (state.get("schema_version") != 1 or not _same_path(state.get("original", ""), original)
-                or not _same_path(state.get("copy", ""), copy)):
-            raise ValueError("Installed launcher state does not match these game folders")
-        if not _same_path(_configured_path(config, "installpath"), copy):
-            raise ValueError("Copied PD2 install path changed; inspect before continuing")
-        if not _same_path(_configured_path(config, "save_path"), copy / "Save"):
-            raise ValueError("Copied PD2 save path is not isolated; inspect before continuing")
+        if (state.get("schema_version") != 1 or not isinstance(state.get("copy"), str)
+                or not _same_path(state["copy"], folder)):
+            raise ValueError("Installed launcher state does not match this game folder")
+        if not _same_path(_configured_path(config, "installpath"), folder):
+            raise ValueError("Selected PD2 install path changed; inspect before continuing")
+        if not _same_path(_configured_path(config, "save_path"), folder / "Save"):
+            raise ValueError("The selected PD2 save path is not isolated; inspect before continuing")
         if not (project / "BH.dll").is_file() or _hash(project / "BH.dll") != state.get("dll_sha256"):
             raise ValueError("Installed native mod was changed outside the launcher")
         _check_data(project / "data", state["files"])
         return state
-    if not _same_path(_configured_path(config, "installpath"), original):
-        raise ValueError("Select a fresh copy whose PD2 configuration still points to the original installation")
+    _configured_path(config, "installpath")
+    _configured_path(config, "save_path")
     if (project / "data").exists() or (project / "data").is_symlink():
-        raise ValueError("The copied game already has loose mod data; it will not be overwritten")
+        raise ValueError("The selected game already has loose mod data; it will not be overwritten")
     if not (project / "BH.dll").is_file() or _hash(project / "BH.dll") != _OFFICIAL_BH:
-        raise ValueError("The copied game's original BH.dll is not the supported version")
-    return {"schema_version": 1, "installed": False, "original": str(original), "copy": str(copy)}
+        raise ValueError("The selected game's original BH.dll is not the supported version")
+    return {"schema_version": 1, "installed": False, "copy": str(folder)}
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -333,13 +324,13 @@ def _lock(meta: Path):
             try:
                 msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
             except OSError as error:
-                raise RuntimeError("Another Roguelike launcher is updating this copy") from error
+                raise RuntimeError("Another Roguelike launcher is updating this folder") from error
         else:
             import fcntl
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
-                raise RuntimeError("Another Roguelike launcher is updating this copy") from error
+                raise RuntimeError("Another Roguelike launcher is updating this folder") from error
         try:
             yield
         finally:
@@ -375,24 +366,19 @@ def _journal(meta: Path) -> tuple[Path, list[dict]]:
     return transaction, pending["entries"]
 
 
-def recover(original: Path, copy: Path) -> bool:
-    """Roll back a recognized interrupted update without changing either save tree."""
-    original, copy = _separate_roots(original, copy)
-    meta, project = copy / _METADATA, copy / "ProjectD2"
+def recover(folder: Path) -> bool:
+    """Roll back a recognized interrupted update without changing saves."""
+    folder = _selected_root(folder)
+    meta, project = folder / _METADATA, folder / "ProjectD2"
     if not (meta / _PENDING).exists():
         return False
-    _no_links_in_copy(copy)
+    _no_links_in_copy(folder)
     _verify_images(project)
-    original_config = _load_json(original / "ProjectD2/ProjectDiablo.json")
-    if not _same_path(_configured_path(original_config, "installpath"), original):
-        raise ValueError("The selected original's PD2 install path does not identify that folder")
-    owner = _load_json(meta / _OWNER)
-    if owner != {"schema_version": 1, "original": str(original), "copy": str(copy)}:
-        raise ValueError("Launcher metadata belongs to different game folders")
+    _check_owner(meta, folder)
     with _lock(meta):
         _require_stopped(project)
         transaction, entries = _journal(meta)
-        _restore(copy, transaction, entries)
+        _restore(folder, transaction, entries)
         (meta / _PENDING).unlink()
         _remove_transaction(transaction)
     return True
@@ -423,23 +409,23 @@ def _prepared_configs(project: Path, copy: Path) -> tuple[dict, dict]:
     return config, settings
 
 
-def _stage_release(original: Path, copy: Path, transaction: Path, package: Package) -> tuple[dict, list[dict]]:
-    project = copy / "ProjectD2"
-    config, settings = _prepared_configs(project, copy)
+def _stage_release(folder: Path, transaction: Path, package: Package) -> tuple[dict, list[dict]]:
+    project = folder / "ProjectD2"
+    config, settings = _prepared_configs(project, folder)
     result = mod_data_plan.render_plan(package.plan, project / "pd2data.mpq",
-                                       copy / "d2data.mpq", transaction / "rendered")
+                                       folder / "d2data.mpq", transaction / "rendered")
     if result["revision"] != package.revision:
         raise ValueError("Rendered revision differs from the downloaded release")
     (transaction / "new-BH.dll").write_bytes(package.dll)
     _atomic_json(transaction / "new-config.json", config)
     _atomic_json(transaction / "new-settings.json", settings)
-    state = {"schema_version": 1, "installed": True, "original": str(original), "copy": str(copy),
+    state = {"schema_version": 1, "installed": True, "copy": str(folder),
              "version": package.version, "revision": package.revision,
              "dll_sha256": hashlib.sha256(package.dll).hexdigest(), "files": result["files"]}
     _atomic_json(transaction / "new-receipt.json", state)
     entries = []
     for index, (name, staged, directory) in enumerate(_TARGETS):
-        target, backup = copy / name, transaction / f"backup-{index}"
+        target, backup = folder / name, transaction / f"backup-{index}"
         previous = _identity(target, directory)
         if previous is not None:
             if directory:
@@ -462,7 +448,7 @@ def _commit_release(copy: Path, transaction: Path, entries: list[dict]) -> None:
             _require_stopped(project)
             target = copy / entry["target"]
             if _identity(target, entry["directory"]) != entry["before"]:
-                raise RuntimeError("Game copy changed during the update")
+                raise RuntimeError("Game folder changed during the update")
             if target.exists():
                 os.replace(target, transaction / f"old-{index}")
             os.replace(transaction / entry["staged"], target)
@@ -476,11 +462,11 @@ def _commit_release(copy: Path, transaction: Path, entries: list[dict]) -> None:
     pending.unlink()
 
 
-def install(original: Path, copy: Path, package: Package) -> dict:
-    """Render and transact a release into a verified copy; never modify original saves."""
-    original, copy = _separate_roots(original, copy)
-    before = inspect(original, copy)
-    project, meta = copy / "ProjectD2", copy / _METADATA
+def install(folder: Path, package: Package) -> dict:
+    """Render and transact a release into the selected folder, preserving saves."""
+    folder = _selected_root(folder)
+    before = inspect(folder)
+    project, meta = folder / "ProjectD2", folder / _METADATA
     _require_stopped(project)
     if package.plan.get("revision", {}).get("revision") != package.revision:
         raise ValueError("Package revision does not match its data plan")
@@ -493,26 +479,26 @@ def install(original: Path, copy: Path, package: Package) -> dict:
     if created_meta:
         meta.mkdir()
         try:
-            _atomic_json(meta / _OWNER, {"schema_version": 1, "original": str(original), "copy": str(copy)})
+            _atomic_json(meta / _OWNER, {"schema_version": 1, "copy": str(folder)})
         except BaseException:
             if not any(meta.iterdir()):
                 meta.rmdir()
             raise
     try:
         with _lock(meta):
-            if inspect(original, copy) != before:
-                raise RuntimeError("Game copy changed before the update")
+            if inspect(folder) != before:
+                raise RuntimeError("Game folder changed before the update")
             if created_meta and {entry.name for entry in meta.iterdir()} != {".lock", _OWNER}:
                 raise RuntimeError("New launcher metadata contains unexpected files")
             transaction = meta / ("transaction-" + uuid.uuid4().hex)
             transaction.mkdir()
             try:
-                state, entries = _stage_release(original, copy, transaction, package)
+                state, entries = _stage_release(folder, transaction, package)
                 _require_stopped(project)
-                if inspect(original, copy) != before:
-                    raise RuntimeError("Game copy changed while the update was prepared")
-                (copy / "Save").mkdir(exist_ok=True)
-                _commit_release(copy, transaction, entries)
+                if inspect(folder) != before:
+                    raise RuntimeError("Game folder changed while the update was prepared")
+                (folder / "Save").mkdir(exist_ok=True)
+                _commit_release(folder, transaction, entries)
             except BaseException:
                 if not (meta / _PENDING).exists() and transaction.exists():
                     _remove_transaction(transaction)
@@ -542,18 +528,18 @@ def _prepare_resolution_config(project: Path) -> None:
             raise ValueError("Cannot make the copied SGD2FreeResolution.json writable") from error
 
 
-def launch(original: Path, copy: Path) -> int:
-    """Start the already installed copy; the player chooses Single Player."""
-    original, copy = _separate_roots(original, copy)
-    if not (copy / _METADATA / _RECEIPT).is_file():
+def launch(folder: Path) -> int:
+    """Start the installed game; the player chooses Single Player."""
+    folder = _selected_root(folder)
+    if not (folder / _METADATA / _RECEIPT).is_file():
         raise ValueError("Install Roguelike before launching")
-    with _lock(copy / _METADATA):
-        state = inspect(original, copy)
+    with _lock(folder / _METADATA):
+        state = inspect(folder)
         if not state.get("installed"):
             raise ValueError("Install Roguelike before launching")
-        project = copy / "ProjectD2"
+        project = folder / "ProjectD2"
         _require_stopped(project)
-        if not (copy / "Save").is_dir():
+        if not (folder / "Save").is_dir():
             raise ValueError("The isolated Roguelike Save directory is missing")
         _prepare_resolution_config(project)
         process = subprocess.Popen([str(project / "Game.exe"), "-3dfx", "-direct", "-txt"],

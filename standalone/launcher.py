@@ -1,7 +1,6 @@
-"""Windows launcher for a separately copied, offline Roguelike installation."""
+"""Windows launcher for a player-selected, offline Roguelike installation."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import queue
 import sys
@@ -19,9 +18,8 @@ class Launcher(tk.Tk):
         self.minsize(600, 360)
         self.columnconfigure(0, weight=1)
         self.protocol("WM_DELETE_WINDOW", self._close)
-        self.original = tk.StringVar()
-        self.copy = tk.StringVar()
-        self.status = tk.StringVar(value="Select your original PD2 installation and your separate copy.")
+        self.folder = tk.StringVar()
+        self.status = tk.StringVar(value="Select the PD2 folder you want the launcher to modify.")
         self.events = queue.Queue()
         self.busy = False
 
@@ -31,21 +29,17 @@ class Launcher(tk.Tk):
         ttk.Label(frame, text="PD2 Roguelike", font=("TkDefaultFont", 18, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(frame, text="Single Player only • PD2 Season 13 patch 2\n"
+                              "The selected folder will be modified. Copy PD2 first to protect your original.\n"
                               "This does not block PD2 Online; using the mod online may risk your account.\n"
-                              "Make a separate copy of PD2 first. In town, type run start.",
+                              "In town, type run start.",
                   justify="left", wraplength=560).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        ttk.Label(frame, text="Original PD2 installation (read-only)").grid(row=2, column=0, columnspan=2, sticky="w")
-        self.original_entry = ttk.Entry(frame, textvariable=self.original)
-        self.original_entry.grid(row=3, column=0, sticky="ew", pady=(3, 9))
-        self.original_button = ttk.Button(frame, text="Browse…", command=lambda: self.browse(self.original))
-        self.original_button.grid(row=3, column=1, padx=(8, 0), pady=(3, 9))
-        ttk.Label(frame, text="Separate Roguelike copy").grid(row=4, column=0, columnspan=2, sticky="w")
-        self.copy_entry = ttk.Entry(frame, textvariable=self.copy)
-        self.copy_entry.grid(row=5, column=0, sticky="ew", pady=(3, 12))
-        self.copy_button = ttk.Button(frame, text="Browse…", command=lambda: self.browse(self.copy))
-        self.copy_button.grid(row=5, column=1, padx=(8, 0), pady=(3, 12))
+        ttk.Label(frame, text="PD2 installation folder to modify").grid(row=2, column=0, columnspan=2, sticky="w")
+        self.folder_entry = ttk.Entry(frame, textvariable=self.folder)
+        self.folder_entry.grid(row=3, column=0, sticky="ew", pady=(3, 12))
+        self.folder_button = ttk.Button(frame, text="Browse…", command=self.browse)
+        self.folder_button.grid(row=3, column=1, padx=(8, 0), pady=(3, 12))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=6, column=0, columnspan=2, sticky="w")
+        buttons.grid(row=4, column=0, columnspan=2, sticky="w")
         self.install_button = ttk.Button(buttons, text="Install / Update", command=self.update_mod)
         self.install_button.grid(row=0, column=0, padx=(0, 8))
         self.play_button = ttk.Button(buttons, text="Play", command=self.play)
@@ -54,24 +48,16 @@ class Launcher(tk.Tk):
         self.recover_button.grid(row=0, column=2, padx=(0, 8))
         ttk.Button(buttons, text="Licenses", command=self.show_licenses).grid(row=0, column=3)
         ttk.Label(frame, textvariable=self.status, wraplength=540, justify="left").grid(
-            row=7, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        self.controls = (self.original_entry, self.original_button, self.copy_entry,
-                         self.copy_button, self.install_button, self.play_button, self.recover_button)
+            row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        self.controls = (self.folder_entry, self.folder_button,
+                         self.install_button, self.play_button, self.recover_button)
         self._initial_paths()
         self.after(100, self._deliver)
 
     def _initial_paths(self):
         folder = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path.cwd()
         if (folder / "ProjectD2/Game.exe").is_file():
-            self.copy.set(str(folder))
-            receipt = folder / install._METADATA / install._RECEIPT
-            if receipt.is_file():
-                try:
-                    state = json.loads(receipt.read_text(encoding="utf-8"))
-                    if isinstance(state.get("original"), str):
-                        self.original.set(state["original"])
-                except (OSError, ValueError, AttributeError):
-                    pass
+            self.folder.set(str(folder))
 
     def _close(self):
         if self.busy:
@@ -105,22 +91,22 @@ class Launcher(tk.Tk):
         text.configure(state="disabled")
 
 
-    def browse(self, value):
+    def browse(self):
         path = filedialog.askdirectory(parent=self, mustexist=True)
         if path:
-            value.set(path)
+            self.folder.set(path)
 
-    def _paths(self):
-        original, copy = self.original.get().strip(), self.copy.get().strip()
-        if not original or not copy:
-            raise ValueError("Choose both the original PD2 installation and your separate copy.")
-        return Path(original), Path(copy)
+    def _path(self):
+        folder = self.folder.get().strip()
+        if not folder:
+            raise ValueError("Choose the PD2 installation folder to modify.")
+        return Path(folder)
 
     def _run(self, message, operation, success):
         if self.busy:
             return
         try:
-            paths = self._paths()
+            folder = self._path()
         except ValueError as error:
             messagebox.showerror("PD2 Roguelike", str(error), parent=self)
             return
@@ -131,7 +117,7 @@ class Launcher(tk.Tk):
 
         def worker():
             try:
-                self.events.put((success, operation(*paths), None))
+                self.events.put((success, operation(folder), None))
             except Exception as error:
                 self.events.put((success, None, error))
         threading.Thread(target=worker, daemon=True).start()
@@ -153,16 +139,16 @@ class Launcher(tk.Tk):
         self.after(100, self._deliver)
 
     def update_mod(self):
-        def operation(original, copy):
-            # Validate roots before fetching or changing anything in the copy.
-            install.inspect(original, copy)
+        def operation(folder):
+            # Validate the selected folder before fetching or changing its files.
+            install.inspect(folder)
             release = releases.latest()
-            return install.install(original, copy, releases.download(release))
-        self._run("Checking the latest release and installing it into the copy…", operation,
+            return install.install(folder, releases.download(release))
+        self._run("Checking the latest release and installing it into the selected folder…", operation,
                   lambda state: f"Roguelike {state['version']} is installed. Choose Play, then Single Player.")
 
     def play(self):
-        self._run("Starting your separate Roguelike copy…", install.launch,
+        self._run("Starting your Roguelike installation…", install.launch,
                   lambda pid: "Choose Single Player. Online play is not blocked and may risk your account.")
 
     def recover(self):
