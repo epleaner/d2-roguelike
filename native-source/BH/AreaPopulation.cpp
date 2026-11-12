@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "AreaPopulation.h"
+#include "ServerMonsters.h"
 #include "Constants.h"
 #include "D2Ptrs.h"
 #include "LabProfile.h"
@@ -245,5 +246,57 @@ bool AppendInactive(void* game, UnitAny* player, json& census, std::string& erro
         return fail("inactive population context changed during traversal");
     census["population_complete"] = true;
     return true;
+}
+
+bool PrepareRoomClear(std::string& error) {
+    static const bool bound = [] { std::string ignored; return Bind(ignored); }();
+    if (!bound) error = "unsupported S13 inactive population bindings";
+    return bound;
+}
+ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* player, unsigned expectedLevel) {
+    using State = ServerMonsters::RoomClearState;
+    if (!game || !player || !player->pPath || !player->pPath->pRoom1 ||
+        !player->pPath->pRoom1->pRoom2 || !player->pPath->pRoom1->pRoom2->pLevel ||
+        player->dwAct >= 5)
+        return State::Unavailable;
+    Level* const level = player->pPath->pRoom1->pRoom2->pLevel;
+    if (level->dwLevelNo != expectedLevel) return State::Unavailable;
+    const auto* heads = reinterpret_cast<InactiveRoom* const*>(reinterpret_cast<const BYTE*>(game) + 0xD8);
+    sgptDataTable* const* global = p_D2COMMON_sgptDataTable;
+    if (!global || !*global || !(*global)->pMonStatsTxt) return State::Unavailable;
+    const sgptDataTable* const table = *global;
+    size_t lists = 0, monsters = 0;
+    for (const InactiveRoom* list = heads[player->dwAct]; list; list = list->next) {
+        if (++lists > kListLimit) return State::Unavailable;
+        Room2* match = nullptr;
+        size_t rooms = 0;
+        for (Room2* room = level->pRoom2First; room; room = room->pRoom2Next) {
+            if (++rooms > kRoomLimit) return State::Unavailable;
+            if (list->x == static_cast<int32_t>(room->dwPosX * 5) &&
+                list->y == static_cast<int32_t>(room->dwPosY * 5)) {
+                match = room;
+                break;
+            }
+        }
+        if (!match) continue;
+        // A restoring inactive list is not yet disjoint from the active room.
+        if (match->pRoom1) return State::Unavailable;
+        for (const InactiveMonster* monster = list->monsters; monster; monster = monster->next) {
+            if (++monsters > kMonsterLimit || monster->classId < 0 ||
+                static_cast<DWORD>(monster->classId) >= table->dwMonStatsRecs)
+                return State::Unavailable;
+            const DWORD flags = monster->typeFlags;
+            const DWORD alignment = flags & 0x380;
+            const MonStatsTxt& klass = table->pMonStatsTxt[monster->classId];
+            if (!klass.dwFlags.bKillable || klass.dwFlags.bNPC || klass.dwFlags.binTown ||
+                alignment == 0x80 || alignment == 0x100 || (flags & 0x4))
+                continue;
+            if ((monster->unitFlagsEx & 0x100) ||
+                monster->maxHp <= 0 || monster->hp <= 0 || monster->hp > monster->maxHp)
+                return State::Unavailable;
+            return State::LivingHostiles;
+        }
+    }
+    return State::Clear;
 }
 } // namespace AreaPopulation

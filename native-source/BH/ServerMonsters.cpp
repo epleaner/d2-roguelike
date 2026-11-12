@@ -1287,6 +1287,42 @@ json ObserveSnapshot(void* game, UnitAny* serverPlayer, const Request& request,
     return result;
 }
 
+bool PrepareRoomClear(std::string& error) {
+    static const bool bound = [] { std::string ignored; return Bind(ignored); }();
+    if (!bound) { error = "unsupported S13 monster bindings"; return false; }
+    return AreaPopulation::PrepareRoomClear(error);
+}
+// The current game thread owns these room and unit lists for this traversal.
+RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel) {
+    if (!game || !player || player->dwType != UNIT_PLAYER || !player->pPath ||
+        !player->pPath->pRoom1 || !player->pPath->pRoom1->pRoom2 ||
+        !player->pPath->pRoom1->pRoom2->pLevel)
+        return RoomClearState::Unavailable;
+    Level* const area = player->pPath->pRoom1->pRoom2->pLevel;
+    if (area->dwLevelNo != expectedLevel) return RoomClearState::Unavailable;
+    unsigned rooms = 0, units = 0;
+    for (Room2* metadata = area->pRoom2First; metadata; metadata = metadata->pRoom2Next) {
+        if (++rooms > 256) return RoomClearState::Unavailable;
+        Room1* const active = metadata->pRoom1;
+        if (!active) continue;
+        for (UnitAny* unit = active->pUnitFirst; unit; unit = unit->pRoomNext) {
+            if (++units > 8192) return RoomClearState::Unavailable;
+            if (unit->dwType != UNIT_MONSTER) continue;
+            if (!unit->pStats || !unit->pMonsterData || !unit->pMonsterData->pMonStatsTxt)
+                return RoomClearState::Unavailable;
+            const MonStatsTxt& klass = *unit->pMonsterData->pMonStatsTxt;
+            if (!klass.dwFlags.bKillable || klass.dwFlags.bNPC || klass.dwFlags.binTown ||
+                D2COMMON_GetUnitStat(unit, STAT_ALIGNMENT, 0) != 0 ||
+                unit->dwMode == NPC_MODE_DEATH || unit->dwMode == NPC_MODE_DEAD)
+                continue;
+            if (static_cast<int>(D2COMMON_GetUnitStat(unit, 6, 0)) > 0)
+                return RoomClearState::LivingHostiles;
+        }
+    }
+    if (!rooms) return RoomClearState::Unavailable;
+    return AreaPopulation::QueryInactiveRoomClear(game, player, expectedLevel);
+}
+
 json Execute(void* game, UnitAny* serverPlayer, const Request& request) {
     Room1* room = nullptr;
     DWORD level = 0;

@@ -230,6 +230,7 @@ bool ClearRunAuraSkill(void* game, UnitAny* player);
 const SkillsTxt* RunAuraSkill(const RoguelikeAura::Config* config);
 std::atomic<bool> runStarterSettled{false};
 std::atomic<bool> runBossKillWitness{false}; // Server-certified death; client only requests a later census.
+std::atomic<bool> runClearRetry{false}; // A witnessed clear awaits a stable room snapshot.
 int runArrivalLevel = 0; // Server-thread-only target while the fresh room is constructed.
 int runRootLevel = 0; // First active run area; 20 is the authored Tower.
 void* runAreaUsageGame = nullptr;
@@ -1340,26 +1341,30 @@ bool ExactAffixes(UnitAny* item, const Pending& request) {
     }
     return true;
 }
-json Generate(void* game, UnitAny* player, const Pending& request,
-    UnitAny* dropper = nullptr, bool forceSockets = false,
-    DWORD socketSeed = 0) {
+struct GroundItemResult {
+    UnitAny* item = nullptr;
+    const char* error = nullptr;
+    int x = 0, y = 0;
+    bool staleEpoch = false;
+};
+GroundItemResult CreateGroundItem(void* game, UnitAny* player, const Pending& request,
+    UnitAny* dropper, bool forceSockets, DWORD socketSeed, bool identify) {
     if (!request.expectedEpoch.empty() &&
         !ObservationTelemetry::MatchesContext(request.expectedEpoch, game, player))
-        return {{"ok", false}, {"code", "stale_epoch"}, {"error", "session epoch changed"},
-            {"request_id", request.id}};
+        return {nullptr, "session epoch changed", 0, 0, true};
     if (!game || !player || player->dwType != UNIT_PLAYER || player->dwUnitId != request.playerId ||
-        !player->pPath || !player->pPath->pRoom1) return Failure("server player context changed");
+        !player->pPath || !player->pPath->pRoom1) return {nullptr, "server player context changed"};
     UnitAny* location = dropper ? dropper : player;
     if (dropper && (!Readable(dropper, sizeof(UnitAny)) ||
         dropper->dwType != UNIT_MONSTER || !dropper->pPath ||
         !Readable(dropper->pPath, sizeof(Path)) || !dropper->pPath->pRoom1))
-        return Failure("server monster drop anchor changed");
+        return {nullptr, "server monster drop anchor changed"};
     Room1* room = D2COMMON_GetRoomFromUnit(location);
-    if (!room || !room->Coll) return Failure("server collision room unavailable");
+    if (!room || !room->Coll) return {nullptr, "server collision room unavailable"};
     CollMap* collision = room->Coll;
     uint64_t cells = uint64_t(collision->dwSizeGameX) * collision->dwSizeGameY;
     if (!cells || cells > 65536 || !Readable(collision->pMapStart, static_cast<size_t>(cells) * sizeof(WORD)))
-        return Failure("server collision map invalid");
+        return {nullptr, "server collision map invalid"};
     int x = location->pPath->xPos, y = location->pPath->yPos;
     bool placement = false;
     for (int radius = 0; radius <= 4 && !placement; ++radius) {
@@ -1374,7 +1379,7 @@ json Generate(void* game, UnitAny* player, const Pending& request,
             }
         }
     }
-    if (!placement) return Failure("no free nearby ground tile in the loaded server room");
+    if (!placement) return {nullptr, "no free nearby ground tile in the loaded server room"};
     Drop drop = {};
     drop.unit = location; drop.game = game; drop.level = request.level;
     drop.baseId = request.baseId; drop.spawnType = ITEM_MODE_ON_GROUND;
@@ -1383,16 +1388,16 @@ json Generate(void* game, UnitAny* player, const Pending& request,
     drop.initFlags = 1;
     // Every measured constructor wrapper reads this WORD from Game + 0x78.
     drop.format = *reinterpret_cast<WORD*>(static_cast<BYTE*>(game) + 0x78);
-    if (request.setId >= 0 && drop.format < 1) return Failure("set item constructor requires expansion item format");
+    if (request.setId >= 0 && drop.format < 1) return {nullptr, "set item constructor requires expansion item format"};
     drop.quality = request.quality; drop.uniqueIndex = (request.quality == 5 ? request.setId : request.uniqueId) + 1;
     if (forceSockets) {
         // Use the pinned native forced-drop path so socket seeds and flags are applied before publication.
         drop.force = TRUE;
-        drop.flags = ITEM_HASSOCKETS;
+        drop.flags = ITEM_HASSOCKETS | ITEM_IDENTIFIED; // Forced white items use the native ground flags.
         // The forced constructor takes durability from these fields; zero makes it indestructible.
         const ItemsTxt* baseText = D2COMMON_GetItemText(request.baseId);
         if (!Readable(baseText, sizeof(*baseText)))
-            return Failure("forced socket base item data unavailable");
+            return {nullptr, "forced socket base item data unavailable"};
         const unsigned maximumDurability =
             baseText->bnodurability ? 0u : baseText->bdurability;
         drop.maxDurability = static_cast<int>(maximumDurability);
@@ -1407,7 +1412,7 @@ json Generate(void* game, UnitAny* player, const Pending& request,
     if (request.quality == 4 || request.quality == 6) {
         D2MagicAffixDataTbl* affixes = D2COMMON_10492_DATATBLS_GetMagicAffixDataTables();
         if (!affixes || !affixes->pMagicAffixTxt || !affixes->pMagicPrefix || !affixes->pMagicSuffix)
-            return Failure("server affix tables unavailable");
+            return {nullptr, "server affix tables unavailable"};
         // Public IDs and stored item affixes are global one-based records.
         // The constructor's preferred indices are relative to each kind table.
         const int prefixOffset = static_cast<int>(affixes->pMagicPrefix - affixes->pMagicAffixTxt);
@@ -1417,14 +1422,25 @@ json Generate(void* game, UnitAny* player, const Pending& request,
             drop.suffixes[i] = request.suffixes[i] ? request.suffixes[i] - suffixOffset : 0;
         }
     }
-    if (request.quality == 5 && !SetSelectorReady())
-        return Failure("S13 set selector bindings changed before construction");
     Create constructor = originalNaturalDrop ? originalNaturalDrop : createItem;
-    if (!constructor) return Failure("native server item constructor unavailable");
+    if (!constructor) return {nullptr, "native server item constructor unavailable"};
     UnitAny* item = constructor(game, &drop, 1);
-    if (!item || !item->pItemData) return Failure("native server constructor returned no item");
+    if (!item || !item->pItemData) return {item, "native server constructor returned no item"};
     D2COMMON_SetItemFlag(item, 0x2000, FALSE); // not a vendor-store item
-    D2COMMON_SetItemFlag(item, 0x10, TRUE);
+    if (identify) D2COMMON_SetItemFlag(item, 0x10, TRUE);
+    return {item, nullptr, x, y};
+}
+json Generate(void* game, UnitAny* player, const Pending& request,
+    UnitAny* dropper = nullptr, bool forceSockets = false,
+    DWORD socketSeed = 0) {
+    const GroundItemResult generated = CreateGroundItem(
+        game, player, request, dropper, forceSockets, socketSeed, true);
+    if (generated.staleEpoch)
+        return {{"ok", false}, {"code", "stale_epoch"}, {"error", generated.error},
+            {"request_id", request.id}};
+    if (generated.error) return Failure(generated.error);
+    UnitAny* item = generated.item;
+    const int x = generated.x, y = generated.y;
     json result = {{"ok", true}, {"status", "spawned"}, {"request_id", request.id},
         {"item_id", item->dwUnitId}, {"class_id", item->dwTxtFileNo}, {"quality", item->pItemData->dwQuality},
         {"file_index", item->pItemData->dwFileIndex}, {"server_thread_id", GetCurrentThreadId()},
@@ -1914,32 +1930,6 @@ bool RoguelikeMonsterDropContext(void* game, Drop* drop, int& area) {
         (zoneSlots[area].kind == Pending::ZoneKind::Monster ||
          zoneSlots[area].kind == Pending::ZoneKind::Boss);
 }
-bool ApplyRunDropIdentificationPolicy(UnitAny* item) {
-    if (!Readable(item, offsetof(UnitAny, pItemData) + sizeof(item->pItemData)) ||
-        item->dwType != UNIT_ITEM ||
-        !Readable(item->pItemData, offsetof(ItemData, dwFlags) +
-            sizeof(item->pItemData->dwFlags)))
-        return false;
-    const bool identified = RoguelikeLoot::ShouldIdentifyDrop(
-        item->pItemData->dwQuality);
-    D2COMMON_SetItemFlag(item, RoguelikeLoot::kIdentifiedItemFlag,
-        identified ? TRUE : FALSE);
-    return RoguelikeLoot::IsIdentified(item->pItemData->dwFlags) == identified;
-}
-
-UnitAny* RejectNaturalRunDrop(void* game, UnitAny* item,
-    const std::string& reason) {
-    const bool removed = RemoveRolledItem(game, runPlayer, item);
-    runError = reason + (removed ? " removed" : " cleanup uncertain");
-    return removed ? nullptr : item;
-}
-UnitAny* PassNaturalRunDrop(void* game, Drop* drop, int flags) {
-    UnitAny* item = originalNaturalDrop(game, drop, flags);
-    if (item && !ApplyRunDropIdentificationPolicy(item))
-        return RejectNaturalRunDrop(
-            game, item, "natural Roguelike drop identification policy failed");
-    return item;
-}
 bool RoguelikeOwnedChestDropContext(void* game, Drop* drop) {
     if (!game || game != runGame.load(std::memory_order_acquire) ||
         !Readable(drop, sizeof(Drop)) || drop->game != game ||
@@ -2011,7 +2001,7 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
         if (!RoguelikeLoot::ChestNaturalDropAllowed(
                 drop->quality, potion))
             return nullptr;
-        return PassNaturalRunDrop(game, drop, flags);
+        return originalNaturalDrop(game, drop, flags);
     }
     int area = -1;
     if (!RoguelikeMonsterDropContext(game, drop, area))
@@ -2029,13 +2019,11 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
         drop->baseId < 0 ||
         drop->baseId >= bases->nWeaponsTxtRecordCount +
             bases->nArmorTxtRecordCount)
-        return PassNaturalRunDrop(game, drop, flags);
+        return originalNaturalDrop(game, drop, flags);
     ++naturalEquipmentCalls;
     naturalEquipmentQuality = drop->quality;
     naturalEquipmentBase = drop->baseId;
-    const DWORD entropy = GetTickCount() ^ drop->unit->dwUnitId ^
-        (drop->baseId * 2654435761u) ^
-        (++naturalEquipmentForced * 2246822519u);
+    ++naturalEquipmentForced;
     const int quality =
         zoneSlots[area].affixes.quality == RoguelikeAffixes::Quality::Magic ? 4 :
         zoneSlots[area].affixes.quality == RoguelikeAffixes::Quality::Rare ? 6 : 2;
@@ -2045,35 +2033,29 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
         ++naturalEquipmentRejected;
         return nullptr;
     }
-    const bool validItem = Readable(item, sizeof(UnitAny));
-    const bool validData = validItem &&
-        Readable(item->pItemData, sizeof(ItemData));
-    if (!validData ||
-        item->dwTxtFileNo != static_cast<DWORD>(drop->baseId) ||
-        item->pItemData->dwQuality != static_cast<DWORD>(quality)) {
-        ++naturalEquipmentRejected;
-        const std::string mismatch = "natural equipment mismatch base " +
-            std::to_string(validItem ? item->dwTxtFileNo : 0) + "/" +
-            std::to_string(drop->baseId) + " quality " +
-            std::to_string(validData ? item->pItemData->dwQuality : 0) +
-            "/" + std::to_string(quality);
-        return RejectNaturalRunDrop(game, item, mismatch);
-    }
-    if (!ApplyRunDropIdentificationPolicy(item)) {
-        ++naturalEquipmentRejected;
-        return RejectNaturalRunDrop(
-            game, item, "natural Roguelike equipment identification policy failed");
-    }
     return item;
 }
 #include "RoguelikeWssCorruption.h"
+void ReportRunDropFailure(void* game, UnitAny* player, const json& failure) {
+    ++runDropFailureCount;
+    runDropError = failure.value("error", std::string("reward creation failed"));
+    const bool uncertain = failure.value("cleanup_uncertain", false);
+    if (uncertain) runError = "reward cleanup uncertain: " + runDropError;
+    const char* text = uncertain ?
+        "A reward could not be safely removed; the run has stopped." :
+        "A reward could not be created; the run will continue.";
+    BYTE message[128] = {0x15, 1, 0};
+    const size_t length = strlen(text);
+    memcpy(message + 3, text, length);
+    originalChat(game, player, message, static_cast<int>(length + 4));
+}
 json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
     int quality, bool starter, DWORD entropy, int sockets = 0,
     UnitAny* dropper = nullptr,
     RoguelikeLoot::BaseKind baseKind = RoguelikeLoot::BaseKind::Equipment,
     int charmSize = 0, bool corruptedUnique = false,
     int uniqueLevelBonus = 0, const int* excludedUniqueIds = nullptr,
-    unsigned excludedUniqueCount = 0) {
+    unsigned excludedUniqueCount = 0, bool includeDiagnostics = false) {
     if (sockets < 0 || sockets > 3)
         return Failure("requested socket count is outside the supported range");
     if (corruptedUnique && quality != 7)
@@ -2096,82 +2078,41 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
     const DWORD socketSeed = sockets ?
         RoguelikeLoot::SeedForMaximumSockets(reward.seed,
             static_cast<std::uint32_t>(maximumSockets)) : 0;
-    json result = Generate(game, player, reward,
-        dropper, sockets != 0, socketSeed);
-    if (!result.value("ok", false)) {
-        if (result.contains("item_id") &&
-            result["item_id"].is_number_unsigned()) {
-            UnitAny* rejected =
-                FindRolledItem(game, result["item_id"].get<DWORD>());
-            if (rejected && !RemoveRolledItem(game, player, rejected))
-                result["cleanup"] = "failed generated item cleanup uncertain";
-            else if (rejected)
-                result["cleanup"] = "failed generated item removed";
-        }
-        return result;
+    const GroundItemResult generated = CreateGroundItem(
+        game, player, reward, dropper, sockets != 0, socketSeed, false);
+    if (generated.error) {
+        json failure = Failure(generated.error);
+        if (generated.item)
+            failure["cleanup_uncertain"] =
+                !RemoveRolledItem(game, player, generated.item);
+        return failure;
     }
-    if (!result.contains("item_id") ||
-        !result["item_id"].is_number_unsigned()) {
-        result["ok"] = false;
-        result["error"] = "generated Roguelike reward lacks item identity";
-        return result;
-    }
-    UnitAny* item = FindRolledItem(game, result["item_id"].get<DWORD>());
-    const auto reject = [&](const char* reason) {
-        const bool present = item != nullptr;
-        const bool removed = !present || RemoveRolledItem(game, player, item);
-        result["ok"] = false;
-        result["error"] = std::string(reason) +
-            (!present ? "; item absent" :
-                removed ? "; item removed" : "; cleanup uncertain");
-    };
-    const bool itemDataReadable =
-        item && Readable(item->pItemData, sizeof(ItemData));
-    if (!itemDataReadable ||
-        item->dwTxtFileNo != static_cast<DWORD>(reward.baseId) ||
-        item->pItemData->dwQuality != static_cast<DWORD>(reward.quality)) {
-        reject("generated Roguelike reward identity or quality changed");
-        return result;
-    }
+    UnitAny* item = generated.item;
     if (corruptedUnique &&
-        !ApplyWssCorruption(game, item, entropy,
-            corruption, corruptionError)) {
-        reject(corruptionError.c_str());
-        return result;
+        !ApplyWssCorruption(game, item, entropy, corruption, corruptionError)) {
+        json failure = Failure(corruptionError);
+        failure["cleanup_uncertain"] = !RemoveRolledItem(game, player, item);
+        return failure;
     }
-    if (!ApplyRunDropIdentificationPolicy(item)) {
-        reject("generated Roguelike reward identification policy failed");
-        return result;
-    }
-    result["identified"] =
-        RoguelikeLoot::IsIdentified(item->pItemData->dwFlags);
+    json result = {{"ok", true}, {"item_id", item->dwUnitId},
+        {"quality", item->pItemData->dwQuality}};
     if (quality == 7) {
-        std::string error;
-        if (!ValidateRewardUnique(item, reward, itemLevel, playerLevel,
-                baseKind, charmSize, uniqueLevelBonus, corruptedUnique,
-                corruptedUnique ? &corruption : nullptr,
-                result, error)) {
-            reject(error.c_str());
-            return result;
+        result["unique_id"] = item->pItemData->dwFileIndex;
+        if (includeDiagnostics) {
+            result["item_level"] = item->pItemData->dwItemLevel;
+            result["corrupted"] = corruptedUnique;
+            if (corruptedUnique) result["corruption"] = WssCorruptionJson(corruption);
         }
-    }
-    if (!sockets) return result;
-    result["max_sockets"] = maximumSockets;
-    const int actualSockets = D2COMMON_GetUnitStat(item, STAT_SOCKETS, 0);
-    result["sockets"] = actualSockets;
-    const DWORD itemFlags = item->pItemData->dwFlags;
-    const bool socketFlag = (itemFlags & ITEM_HASSOCKETS) != 0;
-    if (actualSockets != static_cast<int>(maximumSockets) || !socketFlag) {
-        reject("native maximum socket count or flag did not materialize");
     }
     return result;
 }
 json DropBossCorruptedUnique(void* game, UnitAny* player,
     int itemLevel, int playerLevel, DWORD seed, UnitAny* dropper,
-    const int* excludedUniqueIds, unsigned excludedUniqueCount) {
+    const int* excludedUniqueIds, unsigned excludedUniqueCount,
+    bool includeDiagnostics = false) {
     return DropRunReward(game, player, itemLevel, playerLevel, 7, false,
         seed, 0, dropper, RoguelikeLoot::BaseKind::Equipment, 0, true, 4,
-        excludedUniqueIds, excludedUniqueCount);
+        excludedUniqueIds, excludedUniqueCount, includeDiagnostics);
 }
 void ReportCorruptionTest(void* game, UnitAny* player) {
     if (!game || !player || player->dwType != UNIT_PLAYER) return;
@@ -2179,7 +2120,7 @@ void ReportCorruptionTest(void* game, UnitAny* player) {
     json result = playerLevel >= 1 && playerLevel <= 99 ?
         DropBossCorruptedUnique(game, player, playerLevel, playerLevel,
             GetTickCount() ^ player->dwUnitId ^
-                (playerLevel * 2654435761u), nullptr, nullptr, 0) :
+                (playerLevel * 2654435761u), nullptr, nullptr, 0, true) :
         Failure("corruption test has no valid character level");
     std::string text;
     if (!result.value("ok", false)) {
@@ -2315,37 +2256,16 @@ json DropRunMaterial(void* game, UnitAny* player, int itemLevel, int playerLevel
     reward.seed = entropy ? entropy : 1;
     reward.expectedEpoch = runEpoch;
     reward.baseId = base;
-    json result = Generate(game, player, reward, dropper);
-    if (!result.value("ok", false)) return result;
-    if (!result.contains("item_id") ||
-        !result["item_id"].is_number_unsigned()) {
-        result["ok"] = false;
-        result["error"] = "generated Roguelike material lacks item identity";
-        return result;
+    const GroundItemResult generated = CreateGroundItem(
+        game, player, reward, dropper, false, 0, false);
+    if (generated.error) {
+        json failure = Failure(generated.error);
+        if (generated.item)
+            failure["cleanup_uncertain"] =
+                !RemoveRolledItem(game, player, generated.item);
+        return failure;
     }
-    UnitAny* item = FindRolledItem(game, result["item_id"].get<DWORD>());
-    const auto reject = [&](const char* reason) {
-        const bool present = item != nullptr;
-        const bool removed = !present || RemoveRolledItem(game, player, item);
-        result["ok"] = false;
-        result["error"] = std::string(reason) +
-            (!present ? "; item absent" :
-                removed ? "; item removed" : "; cleanup uncertain");
-    };
-    if (!item || !Readable(item->pItemData, sizeof(ItemData)) ||
-        item->dwTxtFileNo != static_cast<DWORD>(base) ||
-        item->pItemData->dwQuality != 2) {
-        reject("generated Roguelike material identity or quality changed");
-        return result;
-    }
-    if (!ApplyRunDropIdentificationPolicy(item)) {
-        reject("generated Roguelike material identification policy failed");
-        return result;
-    }
-    result["identified"] =
-        RoguelikeLoot::IsIdentified(item->pItemData->dwFlags);
-    result["material"] = kind == RunMaterial::Gem ? "gem" : "rune";
-    return result;
+    return {{"ok", true}, {"item_id", generated.item->dwUnitId}};
 }
 int MonsterDropQuality(int itemLevel, DWORD entropy) {
     std::minstd_rand random(entropy ? entropy : 1);
@@ -2377,9 +2297,6 @@ json DropRunCategory(void* game, UnitAny* player, UnitAny* monster,
     json result = spawn(quality, charmSize);
     if (noEligibleRewardBase(result) && (quality == 5 || quality == 7))
         result = spawn(charm ? 4 : 6, charm ? charmSize : 0);
-    if (kind == RoguelikeLoot::BaseKind::Jewel &&
-        result.value("ok", false))
-        result["material"] = "jewel";
     return result;
 }
 json DropRunJewel(void* game, UnitAny* player, UnitAny* monster,
@@ -2399,16 +2316,6 @@ json DropRunSocketable(void* game, UnitAny* player, UnitAny* monster,
     default:
         return DropRunJewel(game, player, monster, itemLevel, playerLevel, entropy);
     }
-}
-bool RewardHasCode(const json& reward, const char* expected) {
-    if (!reward.contains("code") || !reward["code"].is_string()) return false;
-    const std::string& code = reward["code"].get_ref<const std::string&>();
-    return code.size() == 3 && !memcmp(code.data(), expected, 3);
-}
-bool RewardHasMaterial(const json& reward, const char* expected) {
-    if (!reward.contains("material") || !reward["material"].is_string())
-        return false;
-    return reward["material"].get_ref<const std::string&>() == expected;
 }
 json DropMonsterItem(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int playerLevel, RoguelikeLoot::DropKind kind,
@@ -2455,93 +2362,18 @@ json DropMonsterItem(void* game, UnitAny* player, UnitAny* monster,
     }
     return Failure("invalid monster-drop plan");
 }
-bool ValidMonsterReward(const json& reward) {
-    const int quality = reward.value("quality", 0);
-    const bool expectedIdentified =
-        RoguelikeLoot::ShouldIdentifyDrop(quality);
-    return reward.value("ok", false) && reward.contains("item_id") &&
-        reward["item_id"].is_number_unsigned() && reward.contains("quality") &&
-        reward.value("identified", !expectedIdentified) == expectedIdentified;
-}
-bool StandardRewardQuality(int quality) {
-    return quality == 2 || quality == 4 || quality == 5 ||
-        quality == 6 || quality == 7;
-}
-bool CharmRewardQuality(int quality) {
-    return quality == 2 || quality == 4 || quality == 7;
-}
-bool RewardHasSocketableMaterial(const json& reward) {
-    return RewardHasMaterial(reward, "gem") ||
-        RewardHasMaterial(reward, "rune") ||
-        RewardHasMaterial(reward, "jewel");
-}
-bool RewardIsSocketedEquipment(const json& reward, int quality) {
-    const unsigned sockets = reward.value("sockets", 0u);
-    return quality == 2 && sockets > 0 &&
-        sockets == reward.value("max_sockets", 0u);
-}
-bool RewardIsJewelry(const json& reward, int quality) {
-    const bool jewelryCode = RewardHasCode(reward, "rin") ||
-        RewardHasCode(reward, "amu");
-    return jewelryCode && StandardRewardQuality(quality);
-}
-bool RewardIsCharm(const json& reward, int quality, int charmSize = 0) {
-    const bool charmCode = charmSize == 1 ? RewardHasCode(reward, "cm1") :
-        charmSize == 2 ? RewardHasCode(reward, "cm2") :
-        charmSize == 3 ? RewardHasCode(reward, "cm3") :
-        RewardHasCode(reward, "cm1") || RewardHasCode(reward, "cm2") ||
-            RewardHasCode(reward, "cm3");
-    return charmCode && CharmRewardQuality(quality);
-}
-bool MonsterDropMatches(RoguelikeLoot::DropKind kind, const json& reward,
-    int charmSize = 0) {
-    if (!ValidMonsterReward(reward)) return false;
-    const int quality = reward.value("quality", 0);
-    switch (kind) {
-    case RoguelikeLoot::DropKind::Equipment:
-        return StandardRewardQuality(quality);
-    case RoguelikeLoot::DropKind::SocketedEquipment:
-        return RewardIsSocketedEquipment(reward, quality);
-    case RoguelikeLoot::DropKind::Gem:
-        return RewardHasMaterial(reward, "gem");
-    case RoguelikeLoot::DropKind::Rune:
-        return RewardHasMaterial(reward, "rune");
-    case RoguelikeLoot::DropKind::Socketable:
-        return RewardHasSocketableMaterial(reward);
-    case RoguelikeLoot::DropKind::Jewelry:
-        return RewardIsJewelry(reward, quality);
-    case RoguelikeLoot::DropKind::Charms:
-        return RewardIsCharm(reward, quality, charmSize);
-    case RoguelikeLoot::DropKind::Unique:
-        return quality == 7;
-    case RoguelikeLoot::DropKind::Set:
-        return quality == 5;
-    case RoguelikeLoot::DropKind::None:
-        return false;
-    }
-    return false;
-}
 bool DropMonsterGroup(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int playerLevel, RoguelikeLoot::DropGroup group,
     unsigned firstIndex, std::minstd_rand& random) {
-    if (group.count > 4 ||
-        (group.count == 0) != (group.kind == RoguelikeLoot::DropKind::None)) {
-        runDropError = "invalid monster-drop group";
-        return false;
-    }
     for (unsigned index = 0; index < group.count; ++index) {
         const unsigned materialSlot = firstIndex + index;
         const DWORD entropy = static_cast<DWORD>(random()) ^
             monster->dwUnitId ^ (materialSlot * 2246822519u);
-        const int charmSize = group.kind == RoguelikeLoot::DropKind::Charms ?
-            static_cast<int>(
-                RoguelikeLoot::CharmSizeForRewardIndex(materialSlot)) : 0;
         const json reward = DropMonsterItem(
             game, player, monster, itemLevel, playerLevel, group.kind,
             entropy, materialSlot);
-        if (!MonsterDropMatches(group.kind, reward, charmSize)) {
-            runDropError = "monster drop violated its focus or identification contract: " +
-                reward.value("error", reward.dump());
+        if (!reward.value("ok", false)) {
+            ReportRunDropFailure(game, player, reward);
             return false;
         }
     }
@@ -2551,7 +2383,7 @@ bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int runDepth, Pending::RewardFocus focus) {
     const int playerLevel = MarketCharacterLevel();
     if (playerLevel < 1 || playerLevel > 99) {
-        runDropError = "monster loot has no valid character level";
+        ReportRunDropFailure(game, player, Failure("monster loot has no valid character level"));
         return false;
     }
     const DWORD seed = GetTickCount() ^ (monster->dwUnitId * 2654435761u);
@@ -2562,12 +2394,6 @@ bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
                 RoguelikeLoot::kBasisPoints));
     const RoguelikeLoot::MonsterDropPlan plan =
         RoguelikeLoot::PlanMonsterDrops(focus, primaryCount);
-    if (!plan.primary.count || plan.primary.count > 4 ||
-        plan.primary.kind == RoguelikeLoot::DropKind::None ||
-        (plan.secondary.count != 0 && plan.secondary.count != 3)) {
-        runDropError = "zone has no valid monster-drop plan";
-        return false;
-    }
     if (!DropMonsterGroup(game, player, monster, itemLevel, playerLevel,
             plan.primary, 0, random) ||
         !DropMonsterGroup(game, player, monster, itemLevel, playerLevel,
@@ -2584,12 +2410,7 @@ bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
             if (rune.value("error", "") ==
                 "no compiled level-eligible gem or rune")
                 return true;
-            runDropError = "monster rune drop uncertain: " +
-                rune.value("error", rune.dump());
-            return false;
-        }
-        if (!MonsterDropMatches(RoguelikeLoot::DropKind::Rune, rune)) {
-            runDropError = "monster rune drop violated its identification policy";
+            ReportRunDropFailure(game, player, rune);
             return false;
         }
     }
@@ -2623,9 +2444,6 @@ UnitAny* FindServerObject(void* game, DWORD id, DWORD expectedClass = 60) {
     HMODULE module = GetModuleHandleA("D2Game.dll");
     if (!module || !game) return nullptr;
     const BYTE* entry = reinterpret_cast<const BYTE*>(module) + 0xE03A0;
-    const BYTE signature[] = {0x85, 0xc9, 0x75, 0x1f, 0x68};
-    if (!Readable(entry, sizeof(signature)) || memcmp(entry, signature, sizeof(signature)))
-        return nullptr;
     UnitAny* found = nullptr;
     __asm {
         mov ecx, game
@@ -2643,9 +2461,6 @@ UnitAny* FindServerMonster(void* game, DWORD id) {
     HMODULE module = GetModuleHandleA("D2Game.dll");
     if (!module || !game || !id) return nullptr;
     const BYTE* entry = reinterpret_cast<const BYTE*>(module) + 0xE03A0;
-    const BYTE signature[] = {0x85, 0xc9, 0x75, 0x1f, 0x68};
-    if (!Readable(entry, sizeof(signature)) || memcmp(entry, signature, sizeof(signature)))
-        return nullptr;
     UnitAny* found = nullptr;
     __asm {
         mov ecx, game
@@ -3375,9 +3190,7 @@ bool MapCatalog(std::string& error) {
 UnitAny* FindRolledItem(void* game, DWORD id) {
     const BYTE* server = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2GAME.dll"));
     const BYTE* lookup = server ? server + 0xE03A0 : nullptr;
-    const BYTE signature[] = {0x85,0xc9,0x75,0x1f,0x68};
-    if (!game || !lookup || !Readable(lookup, sizeof(signature)) ||
-        memcmp(lookup, signature, sizeof(signature))) return nullptr;
+    if (!game || !lookup) return nullptr;
     UnitAny* item = nullptr;
     __asm {
         mov ecx, game
@@ -5467,6 +5280,7 @@ void CancelTownArm() {
     runGame.store(nullptr, std::memory_order_release);
     runStarterSettled.store(false, std::memory_order_release);
     runBossKillWitness.store(false, std::memory_order_release);
+    runClearRetry.store(false, std::memory_order_release);
     runPlayer = nullptr;
     runEpoch.clear();
     runStage.store(0, std::memory_order_release);
@@ -5507,11 +5321,7 @@ UnitAny* OwnedUseItem(void* game, UnitAny* player, DWORD id, const char code[4],
         (text->szCode[3] != ' ' && text->szCode[3] != '\0') || !text->buseable ||
         text->bstackable || text->dwpSpell != 9 ||
         (text->wstate != 0 && text->wstate != 0xffff)) return nullptr;
-    unsigned visited = 0;
-    for (UnitAny* member = D2COMMON_GetItemFromInventory(player->pInventory);
-         member && visited++ < 512; member = D2COMMON_GetNextItemFromInventory(member))
-        if (member == item) return item;
-    return nullptr;
+    return item;
 }
 // S13 D39B0 is the stock post-use item action: ESI=item, EAX=item,
 // ECX=player, stack=game, RET 4. It sends the inventory item update through
@@ -5529,15 +5339,6 @@ bool ConsumeRunItem(void* game, UnitAny* player, UnitAny* item,
     const BYTE* server = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2GAME.dll"));
     if (!server) return false;
     const BYTE* consume = server + 0xD39B0;
-    const BYTE* remove = server + 0xD2D90;
-    const BYTE consumeSignature[] = {0x51,0x53,0x56,0x57,0x8b,0xf9};
-    const BYTE removeSignature[] = {0x51,0x53,0x57,0x8b,0x7c,0x24,0x10};
-    if (!Readable(consume, sizeof(consumeSignature)) ||
-        memcmp(consume, consumeSignature, sizeof(consumeSignature)) ||
-        !Readable(remove, sizeof(removeSignature)) ||
-        memcmp(remove, removeSignature, sizeof(removeSignature)))
-        return false;
-    const DWORD id = item->dwUnitId;
     __asm {
         push game
         mov ecx, player
@@ -5545,7 +5346,7 @@ bool ConsumeRunItem(void* game, UnitAny* player, UnitAny* item,
         mov esi, item
         call consume
     }
-    return FindRolledItem(game, id) == nullptr;
+    return true;
 }
 bool SupportedAuraServerFunction(WORD function) {
     return RoguelikeAura::SupportedServerFunction(function);
@@ -5927,8 +5728,6 @@ int RunItemUseHook(void* game, UnitAny* player, BYTE* packet, int size,
     const bool reroll = rerollEffect != RoguelikeLoot::RerollEffect::None;
     const RoguelikeAura::Config* aura = RoguelikeAura::FindByCode(text->szCode);
     if (!reroll && !aura) return original(game, player, packet, size);
-    std::string profileError;
-    if (!LabProfile::VerifyServer(profileError)) { runItemUseStatus = 4; return 3; }
     if (!OwnedUseItem(game, player, itemId,
             aura ? aura->itemCode : text->szCode, aura != nullptr)) {
         runItemUseStatus = 5; return 3;
@@ -6096,6 +5895,7 @@ int __fastcall ClickHook(void* game, UnitAny* player, BYTE* packet, int size) {
                         if (destination > 0 && destination < 255)
                             runUsedAreas[destination] = true;
                         runBossKillWitness.store(false, std::memory_order_release);
+                        runClearRetry.store(false, std::memory_order_release);
                         runStage.store(destination, std::memory_order_release);
                         runBossDamageCount = 0;
                         runDamageNativeLevel = 0;
@@ -6394,6 +6194,16 @@ json ArmRun(void* game, UnitAny* player, const Pending& request) {
         return Failure("cannot capture safe character route-snapshot identity");
     if (!VerifiedPortalEntry(error) || !InstallChoiceNames(error))
         return Failure("run object or labels unavailable: " + error);
+    const BYTE* mod = reinterpret_cast<const BYTE*>(GetModuleHandleA("ProjectDiablo.dll"));
+    const BYTE mapSignature[] = {0x55,0x8b,0xec,0x6a,0xff};
+    if (!mod || !Readable(mod + 0x2dba50, sizeof(mapSignature)) ||
+        memcmp(mod + 0x2dba50, mapSignature, sizeof(mapSignature)) ||
+        !Readable(mod + 0x2778f0, 8))
+        return Failure("unrecognized native map-monster bindings");
+    if (!ServerMonsters::PrepareRoomClear(error))
+        return Failure("room-clear bindings unavailable: " + error);
+    if (!PrepareWssBindings(error))
+        return Failure("corruption bindings unavailable: " + error);
     if (!CombatTelemetry::ListenForRoguelikeKills(ServerSpawns::OnNaturalKill,
         ServerSpawns::ScaleRoguelikeDamage, error))
         return Failure("native death event unavailable: " + error);
@@ -6421,6 +6231,7 @@ json ArmRun(void* game, UnitAny* player, const Pending& request) {
     runStage.store(rootLevel, std::memory_order_release);
     runStarterSettled.store(false, std::memory_order_release);
     runBossKillWitness.store(false, std::memory_order_release);
+    runClearRetry.store(false, std::memory_order_release);
     runArrivalLevel = 0;
     runKillLootLedger.fill(0);
     runKillLootLedgerLevel = 0;
@@ -7206,6 +7017,7 @@ json BeginRunResume(void* game, UnitAny* player, const Pending& entry,
     runRouteNext[1] = rootLevel;
     runRouteParent[rootLevel] = 1;
     runBossKillWitness.store(false, std::memory_order_release);
+    runClearRetry.store(false, std::memory_order_release);
     runBossDamageCount = 0;
     runDamageNativeLevel = 0;
     runBossProjectileHits = 0;
@@ -7322,6 +7134,7 @@ void ContinueRunResume(void* game, UnitAny* player) {
         runRouteParent[destination] = current;
         ++runResume.currentIndex;
         runBossKillWitness.store(false, std::memory_order_release);
+        runClearRetry.store(false, std::memory_order_release);
         runStage.store(destination, std::memory_order_release);
         runBossDamageCount = 0;
         runDamageNativeLevel = 0;
@@ -7404,25 +7217,17 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
                 RoguelikeLoot::BaseKind::Equipment, 0, false,
                 RoguelikeLoot::kChestUniqueSearchBonus,
                 uniqueIds.data(), uniqueCount);
-            if (!reward.value("ok", false) ||
-                !reward.contains("item_id") ||
-                !reward["item_id"].is_number_unsigned() ||
-                !reward.contains("unique_id") ||
-                !reward["unique_id"].is_number_integer() ||
-                reward.value("corrupted", true) ||
-                reward.value("quality", 0) != 7 ||
-                reward.value("item_level", 0) != itemLevel) {
-                runError = "owned chest uncorrupted unique creation uncertain";
-                return;
+            if (!reward.value("ok", false)) {
+                ReportRunDropFailure(game, player, reward);
+                if (!runError.empty()) return;
+                continue;
             }
             const int uniqueId = reward["unique_id"].get<int>();
             if (!RoguelikeLoot::WssUniqueIdExcluded(
                     uniqueId, uniqueIds.data(), uniqueCount))
                 uniqueIds[uniqueCount++] = uniqueId;
-            runChestRewardIds[level][index][rewardIndex] =
+            runChestRewardIds[level][index][runChestRewardCounts[level][index]++] =
                 reward["item_id"].get<DWORD>();
-            runChestRewardCounts[level][index] =
-                static_cast<BYTE>(rewardIndex + 1);
         }
     }
 }
@@ -7430,14 +7235,16 @@ void SettleRunAfterArrival(void* game, UnitAny* player) {
     const int level = runStage.load(std::memory_order_acquire);
     if (runGame.load(std::memory_order_acquire) != game ||
         runPlayer != player || !PortalArea(player, level)) return;
+    if (level == 20 && runClearRetry.load(std::memory_order_acquire))
+        ServerSpawns::TryCompleteClear(game, level);
     if (level != 20) {
         if (level >= 13 && level <= 254 && zoneSlots[level].configured &&
             zoneSlots[level].kind == Pending::ZoneKind::Chest)
             SettleChestRewards(game, player, level);
         if (level >= 13 && level <= 254 &&
-            runBossKillWitness.load(std::memory_order_acquire) &&
+            (runBossKillWitness.load(std::memory_order_acquire) ||
+             runClearRetry.load(std::memory_order_acquire)) &&
             !runCleared[level] && zoneSlots[level].configured &&
-            BossZone(zoneSlots[level].kind) &&
             ObservationTelemetry::MatchesContext(runEpoch, game, player))
             ServerSpawns::TryCompleteClear(game, level);
         if (runResume.active) ContinueRunResume(game, player);
@@ -7543,6 +7350,19 @@ bool Install(std::string& error) {
     Entry* entry = table + 0x15;
     if (entry->callback == ChatHook) return true;
     if (!LabProfile::VerifyServer(error)) return false;
+    if (!SetSelectorReady()) { error = "unrecognized S13 set selector"; return false; }
+    const BYTE lookupSignature[] = {0x85,0xc9,0x75,0x1f,0x68};
+    const BYTE consumeSignature[] = {0x51,0x53,0x56,0x57,0x8b,0xf9};
+    const BYTE removeSignature[] = {0x51,0x53,0x57,0x8b,0x7c,0x24,0x10};
+    const auto matches = [server](DWORD offset, const BYTE* expected, size_t size) {
+        const BYTE* address = reinterpret_cast<const BYTE*>(server) + offset;
+        return Readable(address, size) && !memcmp(address, expected, size);
+    };
+    if (!matches(0xE03A0, lookupSignature, sizeof(lookupSignature)) ||
+        !matches(0xD39B0, consumeSignature, sizeof(consumeSignature)) ||
+        !matches(0xD2D90, removeSignature, sizeof(removeSignature))) {
+        error = "unrecognized S13 item lookup or consumption bindings"; return false;
+    }
     auto* constructor = reinterpret_cast<BYTE*>(server) + kCreateRva;
     const BYTE prefix[] = {0x55,0x8B,0x6C,0x24,0x0C,0x57,0x8B,0x7C,0x24,0x0C,0x8B,0x47,0x70};
     auto* addGroundItem = reinterpret_cast<BYTE*>(server) + 0xE0F40;
@@ -7759,69 +7579,22 @@ void ApplyStockMapMonster(void* game, UnitAny* monster, int area) {
     // path for our extended IDs and tolerate a prior stock application.
     if (!game || !monster || area < 13 || area > 254 ||
         mapMonsterGame != game || mapMonsterEpoch != zoneEpoch ||
-        !zoneSlots[area].configured || !mapMonsterCount ||
-        *reinterpret_cast<const WORD*>(static_cast<const BYTE*>(game) + 0x21f8) !=
-            mapMonsterCount ||
-        memcmp(static_cast<const BYTE*>(game) + 0x1df8, mapMonsterBytes.data(),
-            8u * mapMonsterCount))
+        !zoneSlots[area].configured || !mapMonsterCount)
         return;
     const HMODULE mod = GetModuleHandleA("ProjectDiablo.dll");
     const BYTE* entry = mod ? reinterpret_cast<const BYTE*>(mod) + 0x2dba50 : nullptr;
-    const BYTE signature[] = {0x55,0x8b,0xec,0x6a,0xff};
-    if (!entry || !Readable(entry, sizeof(signature)) ||
-        memcmp(entry, signature, sizeof(signature))) {
-        runError = "pinned native map-monster applicator unavailable";
-        return;
-    }
+    if (!entry) return;
     using MonsterApplicator = int (__fastcall*)(void*, UnitAny*, void*, int);
     auto apply = reinterpret_cast<MonsterApplicator>(const_cast<BYTE*>(entry));
-    const int before = D2COMMON_GetUnitStat(monster, 7, 0);
+    const bool sample = !mapMonsterSampleUnit;
+    const int before = sample ? D2COMMON_GetUnitStat(monster, 7, 0) : 0;
     const int attached = apply(game, monster, static_cast<BYTE*>(game) + 0x1df8, area);
-    const int after = D2COMMON_GetUnitStat(monster, 7, 0);
+    const int after = sample ? D2COMMON_GetUnitStat(monster, 7, 0) : 0;
     StatList* state = D2COMMON_GetStateStatList(monster, 0xc6);
     if (!state || (!attached && !(area >= 137 && area <= 201))) {
         runError = "native map-monster statlist was not attached"; return;
     }
     const auto& roll = zoneSlots[area].affixes;
-    if (roll.monsterHealthPercent &&
-        ((!attached && D2COMMON_GetStatValueFromStatList(state, 0x1b0, 0) != 1) ||
-         (attached && after <= before))) {
-        runError = "native map-monster max-life effect is absent"; return;
-    }
-    // Stock's 3000-3999 item stats become special 0x1b0..0x1b4 records.
-    // Their native monster applicator converts physical damage into real
-    // elemental statlist entries instead of retaining the source marker.
-    for (unsigned i = 0; i < roll.statCount; ++i) {
-        const auto& stat = roll.stats[i];
-        if (stat.category != 3000 || stat.value <= 0) continue;
-        const int target = stat.mapStat == 432 ? 50 :
-            stat.mapStat == 433 ? 54 : stat.mapStat == 434 ? 48 :
-            stat.mapStat == 435 ? 57 : stat.mapStat == 436 ? 52 : 0;
-        if (!target || D2COMMON_GetStatValueFromStatList(state, target, 0) <= 0) {
-            runError = "native physical-as-extra map stat " +
-                std::to_string(stat.mapStat) + " did not yield elemental damage";
-            return;
-        }
-    }
-    for (unsigned i = 0; i < roll.statCount; ++i) {
-        const auto& stat = roll.stats[i];
-        if (stat.category >= 1000 || stat.category == 76) continue;
-        const WORD layer = static_cast<WORD>(stat.layer ? stat.layer : stat.mapStat);
-        const int expected = stat.value ? stat.value : 1;
-        if (D2COMMON_GetStatValueFromStatList(
-                state, static_cast<int>(stat.category), layer) != expected &&
-            D2COMMON_GetStatValueFromStatList(
-                state, static_cast<int>(stat.category), 0) != expected) {
-            runError = "native monster map stat " + std::to_string(stat.mapStat) +
-                " did not attach target " + std::to_string(stat.category) +
-                " with source layer " + std::to_string(layer) +
-                "; source=" + std::to_string(D2COMMON_GetStatValueFromStatList(
-                    state, static_cast<int>(stat.category), layer)) +
-                "; effective=" + std::to_string(D2COMMON_GetStatValueFromStatList(
-                    state, static_cast<int>(stat.category), 0));
-            return;
-        }
-    }
     bool changed = false;
     for (unsigned i = 0; i < roll.statCount; ++i) {
         const auto& stat = roll.stats[i];
@@ -7833,22 +7606,16 @@ void ApplyStockMapMonster(void* game, UnitAny* monster, int area) {
         if (D2COMMON_GetStatValueFromStatList(state, target, 0) == value) continue;
         D2COMMON_SetPropertyStat(state, target, 0, static_cast<WORD>(stat.mapStat));
         D2COMMON_SetPropertyStat(state, target, value, 0);
-        if (D2COMMON_GetStatValueFromStatList(state, target, 0) != value) {
-            runError = "native monster statlist layer normalization failed"; return;
-        }
         changed = true;
     }
     if (changed) {
         const BYTE* refresh = reinterpret_cast<const BYTE*>(mod) + 0x2778f0;
-        if (!Readable(refresh, 8)) {
-            runError = "native monster state refresh unavailable"; return;
-        }
         using Refresh = void (__stdcall*)(UnitAny*);
         reinterpret_cast<Refresh>(const_cast<BYTE*>(refresh))(monster);
     }
     if (!attached) ++mapMonsterStockExisting;
     else ++mapMonsterApplied;
-    if (!mapMonsterSampleUnit) {
+    if (sample) {
         mapMonsterSampleUnit = monster->dwUnitId;
         mapMonsterSampleArea = area;
         mapMonsterSampleBefore = before;
@@ -8619,38 +8386,25 @@ KillLootClaim ClaimKillLoot(DWORD unitId) {
     return KillLootClaim::Full;
 }
 bool DropBossCorruptedUniques(void* game, UnitAny* player, UnitAny* boss,
-    int itemLevel, int depth, std::string& error) {
+    int itemLevel, int depth) {
     const int playerLevel = MarketCharacterLevel();
     if (playerLevel < 1 || playerLevel > 99) {
-        error = "boss unique rewards have no valid character level";
+        ReportRunDropFailure(game, player, Failure("boss reward has no valid character level"));
         return false;
     }
     std::array<int, RoguelikeLoot::BossCorruptedUniqueCount()> uniqueIds{};
+    unsigned uniqueCount = 0;
     for (unsigned index = 0; index < uniqueIds.size(); ++index) {
         const DWORD rewardSeed = GetTickCount() ^ boss->dwUnitId ^
             (depth * 2654435761u) ^ (0x9e3779b9u * (index + 1));
         const json reward = DropBossCorruptedUnique(game, player,
-            itemLevel, playerLevel, rewardSeed, boss,
-            uniqueIds.data(), index);
+            itemLevel, playerLevel, rewardSeed, boss, uniqueIds.data(), uniqueCount);
         if (!reward.value("ok", false)) {
-            error = "boss corrupted unique " + std::to_string(index + 1) +
-                ": " + reward.value("error", "reward generation failed");
-            return false;
+            ReportRunDropFailure(game, player, reward);
+            if (!runError.empty()) return false;
+            continue;
         }
-        if (!reward.contains("item_id") ||
-            !reward["item_id"].is_number_unsigned() ||
-            !reward.contains("unique_id") ||
-            !reward["unique_id"].is_number_integer() ||
-            !reward.value("corrupted", false) ||
-            reward.value("quality", 0) != 7 ||
-            reward.value("item_level", 0) != itemLevel ||
-            !reward.contains("corruption") ||
-            !reward["corruption"].is_object()) {
-            error = "boss corrupted unique " + std::to_string(index + 1) +
-                ": native reward result failed verification";
-            return false;
-        }
-        uniqueIds[index] = reward["unique_id"].get<int>();
+        uniqueIds[uniqueCount++] = reward["unique_id"].get<int>();
     }
     return true;
 }
@@ -8700,18 +8454,14 @@ void OnNaturalKill(void* game, UnitAny* defender) {
         runError = "boss zone primary identity is unavailable";
         return;
     }
-    if (!DropMonsterLoot(game, runPlayer, defender, itemLevel,
-            zoneSlots[level].depth, zoneSlots[level].reward))
-        ++runDropFailureCount;
+    DropMonsterLoot(game, runPlayer, defender, itemLevel,
+        zoneSlots[level].depth, zoneSlots[level].reward);
+    if (!runError.empty()) return;
     if (BossZone(zoneSlots[level].kind) &&
-        defender->dwUnitId == runBossUnit[level]) {
-        std::string error;
-        if (!DropBossCorruptedUniques(game, runPlayer, defender,
-                itemLevel, level, error)) {
-            runError = error;
-            return;
-        }
-    }
+        defender->dwUnitId == runBossUnit[level] &&
+        !DropBossCorruptedUniques(game, runPlayer, defender, itemLevel, level) &&
+        !runError.empty())
+        return;
     TryCompleteClear(game, level);
 }
 json DropFocusedClearPrimary(void* game, UnitAny* player, int itemLevel,
@@ -8732,7 +8482,7 @@ json DropFocusedClearPrimary(void* game, UnitAny* player, int itemLevel,
     return DropRunReward(game, player, itemLevel, playerLevel,
         quality, false, seed, sockets ? 1 : 0);
 }
-bool AwardFocusedClearLoot(void* game, UnitAny* player, int level, std::string& error) {
+bool AwardFocusedClearLoot(void* game, UnitAny* player, int level) {
     const ZoneSlot& zone = zoneSlots[level];
     if (!zone.configured || runClearRewardIds[level][0]) return false;
     const int playerLevel = MarketCharacterLevel();
@@ -8744,65 +8494,44 @@ bool AwardFocusedClearLoot(void* game, UnitAny* player, int level, std::string& 
         RoguelikeLoot::PlanMonsterDrops(focus, 3);
     const json first = DropFocusedClearPrimary(game, player, itemLevel,
         playerLevel, zone, focus, seed);
-    if (!MonsterDropMatches(plan.primary.kind, first)) {
-        error = "primary reward did not match focus: " +
-            first.value("error", first.dump());
-        return false;
+    if (first.value("ok", false))
+        runClearRewardIds[level][0] = first["item_id"].get<DWORD>();
+    else {
+        ReportRunDropFailure(game, player, first);
+        if (!runError.empty()) return false;
     }
-    runClearRewardIds[level][0] = first["item_id"].get<DWORD>();
     if (!plan.secondary.count) return true;
     const json second = DropRunSocketable(game, player, nullptr, itemLevel,
         playerLevel, static_cast<unsigned>(seed % 3u), seed ^ 0x9e3779b9u);
-    if (!MonsterDropMatches(RoguelikeLoot::DropKind::Socketable, second)) {
-        error = "socket material reward did not match focus: " +
-            second.value("error", second.dump());
-        return false;
+    if (second.value("ok", false))
+        runClearRewardIds[level][1] = second["item_id"].get<DWORD>();
+    else {
+        ReportRunDropFailure(game, player, second);
+        if (!runError.empty()) return false;
     }
-    runClearRewardIds[level][1] = second["item_id"].get<DWORD>();
     return true;
 }
 void TryCompleteClear(void* game, int level) {
     if (!runError.empty() || runCleared[level]) return;
-    ServerMonsters::Request request;
-    request.operation = ServerMonsters::Operation::Area;
-    json census = ServerMonsters::Execute(game, runPlayer, request);
-    if (!census.value("ok", false) || !census.value("room_catalog_complete", false) ||
-        !census.value("population_complete", false) ||
-        census.value("level_id", 0) != level || !census.contains("enemies") ||
-        !census["enemies"].is_array()) {
-        runError = "natural clear census incomplete after witnessed kill";
-        runBossKillWitness.store(false, std::memory_order_release);
-        return;
-    }
-    if (census.value("inactive_hostile_alive_count", -1) != 0) return;
-    for (const auto& monster : census["enemies"])
-        if (!monster.value("dead", false)) return;
-    // Witnessed nonzero death and complete active/inactive zero, not an
-    // empty-on-entry area or an inferred last-kill count.
-    if (census["enemies"].empty()) {
-        runError = "empty area cannot award a witnessed clear";
-        return;
-    }
+    const auto clear = ServerMonsters::QueryRoomClear(game, runPlayer, level);
+    runClearRetry.store(clear == ServerMonsters::RoomClearState::Unavailable,
+        std::memory_order_release);
+    if (clear != ServerMonsters::RoomClearState::Clear) return;
     if (level == 20 && !runStarterRewardId) {
         const json reward = DropRunReward(game, runPlayer, 1,
             MarketCharacterLevel(), 2, true,
-            GetTickCount() ^ census["enemies"][0].value("id", 0u));
-        if (!reward.value("ok", false) || reward.value("quality", 0) != 2 ||
-            !reward.contains("item_id") || !reward["item_id"].is_number_unsigned()) {
-            runError = "guaranteed starter white gear did not materialize";
-            return;
-        }
-        runStarterRewardId = reward["item_id"].get<DWORD>();
-    }
-    if (level != 20) {
-        std::string rewardError;
-        if (!AwardFocusedClearLoot(game, runPlayer, level, rewardError)) {
-            runError = "native clear reward did not materialize as offered: " + rewardError;
-            return;
+            GetTickCount() ^ runPlayer->dwUnitId);
+        if (reward.value("ok", false))
+            runStarterRewardId = reward["item_id"].get<DWORD>();
+        else {
+            ReportRunDropFailure(game, runPlayer, reward);
+            if (!runError.empty()) return;
         }
     }
+    if (level != 20 && !AwardFocusedClearLoot(game, runPlayer, level)) return;
     runCleared[level] = true;
     runBossKillWitness.store(false, std::memory_order_release);
+    runClearRetry.store(false, std::memory_order_release);
     if (!CharacterState::AwardClearLevel(game, runPlayer)) {
         runError = "native clear level award failed";
         return;
@@ -8877,12 +8606,13 @@ void SettleRunFrame() {
         (!runChestSettled[level][0] || !runChestSettled[level][1] ||
          !runChestSettled[level][2]);
     if (!runGame.load(std::memory_order_acquire) ||
-        (level == 20 ? runStarterSettled.load(std::memory_order_acquire) :
+        (level == 20 ? (runStarterSettled.load(std::memory_order_acquire) &&
+            !runClearRetry.load(std::memory_order_acquire)) :
             level < 13 || level > 254 ||
-            (!runBossKillWitness.load(std::memory_order_acquire) && !chestPending))) return;
+            (!runBossKillWitness.load(std::memory_order_acquire) &&
+             !runClearRetry.load(std::memory_order_acquire) && !chestPending))) return;
     if (!PortalArea(player, level)) return;
-    // An empty starter room may skip the population callback; a boss's
-    // final death can outlive the last kill-hook census. Recheck on the server.
+    // Empty starter population and witnessed clears can require a later server frame.
     static DWORD nextAttempt = 0;
     const DWORD now = GetTickCount();
     if (static_cast<LONG>(now - nextAttempt) < 0) return;
@@ -8936,6 +8666,7 @@ void RestoreRoguelikeZones(bool saveSnapshot) {
     runDeathHandled.store(false, std::memory_order_release);
     runStarterSettled.store(false, std::memory_order_release);
     runBossKillWitness.store(false, std::memory_order_release);
+    runClearRetry.store(false, std::memory_order_release);
     CombatTelemetry::StopRoguelikeKills();
     runStage.store(0, std::memory_order_release);
     runRootLevel = 0;

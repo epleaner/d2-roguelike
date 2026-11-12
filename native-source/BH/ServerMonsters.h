@@ -22,6 +22,10 @@ struct Enemy {
     uint16_t present = 0;
 };
 enum class Operation { Spawn, Inspect, Area, Observe };
+// Unavailable never certifies an empty room; the caller owns witnessed-kill policy.
+enum class RoomClearState { Clear, LivingHostiles, Unavailable };
+bool PrepareRoomClear(std::string& error);
+RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel);
 struct Request {
     Operation operation = Operation::Spawn;
     std::vector<Enemy> enemies;

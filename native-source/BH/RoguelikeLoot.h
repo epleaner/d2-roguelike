@@ -107,11 +107,6 @@ constexpr bool IsWssBaseCode(const char (&code)[4]) noexcept {
     return code[0] == 'w' && code[1] == 's' && code[2] == 's' &&
         (code[3] == ' ' || code[3] == '\0');
 }
-constexpr bool IsWssCorruptedUnique(int quality, int corrupted,
-    int corruptor, int expectedMarker) noexcept {
-    return quality == 7 && IsValidWssCorruptionMarker(expectedMarker) &&
-        corrupted == expectedMarker && corruptor == kWssCorruptorValue;
-}
 constexpr bool IsValidWssCorruptionOutput(int outputType, int quality,
     int marker, int corruptor, int effectCount,
     bool allChancesCertain) noexcept {
@@ -190,38 +185,12 @@ constexpr int WssUniqueSearchLevel(int itemLevel, int bonus) noexcept {
     if (itemLevel >= 99 || bonus >= 99 - itemLevel) return 99;
     return itemLevel + (bonus > 0 ? bonus : 0);
 }
-struct NativeUniqueOutput {
-    int id = -1;
-    int idCount = 0;
-    int baseId = -1;
-    int expectedBaseId = -1;
-    int level = 0;
-    int requiredLevel = 0;
-    bool enabled = false;
-};
-constexpr bool IsNativeUniqueOutputEligible(
-    const NativeUniqueOutput& output, int itemLevel, int playerLevel,
-    int bonus) noexcept {
-    return output.enabled && output.id >= 0 && output.id < output.idCount &&
-        output.baseId >= 0 && output.baseId == output.expectedBaseId &&
-        itemLevel >= 1 && itemLevel <= 99 &&
-        playerLevel >= 1 && playerLevel <= 99 &&
-        output.level <= WssUniqueSearchLevel(itemLevel, bonus) &&
-        output.requiredLevel <= playerLevel;
-}
 constexpr bool WssUniqueIdExcluded(int uniqueId, const int* excluded,
     unsigned count) noexcept {
     if (!excluded) return false;
     for (unsigned index = 0; index < count; ++index)
         if (excluded[index] == uniqueId) return true;
     return false;
-}
-constexpr std::uint32_t kIdentifiedItemFlag = 0x10;
-constexpr bool IsIdentified(std::uint32_t itemFlags) noexcept {
-    return (itemFlags & kIdentifiedItemFlag) != 0;
-}
-constexpr bool ShouldIdentifyDrop(int quality) noexcept {
-    return quality < 4 || quality > 7;
 }
 constexpr unsigned StartingDurability(unsigned maximum,
     std::uint32_t roll) noexcept {

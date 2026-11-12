@@ -10,6 +10,21 @@ namespace {
     // The launcher selects the copy; identity follows the loaded executable and
     // BH module, never a caller-supplied directory or the current working directory.
     std::wstring imageDirectory;
+    SRWLOCK imageLock = SRWLOCK_INIT;
+    struct SharedImageLock {
+        SharedImageLock() { AcquireSRWLockShared(&imageLock); }
+        ~SharedImageLock() { ReleaseSRWLockShared(&imageLock); }
+    };
+    struct ExclusiveImageLock {
+        ExclusiveImageLock() { AcquireSRWLockExclusive(&imageLock); }
+        ~ExclusiveImageLock() { ReleaseSRWLockExclusive(&imageLock); }
+    };
+    // Retained references prevent a verified image from being unloaded and
+    // replaced at the same base address while its verification is cached.
+    HMODULE verifiedClient = nullptr;
+    HMODULE verifiedCommon = nullptr;
+    HMODULE verifiedServer = nullptr;
+    HMODULE verifiedMod = nullptr;
     struct Image { const wchar_t* name; const char* digest; };
     constexpr Image kImages[] = {
         {L"Game.exe", "74fe9c092a521f7710392548c82f81544e531107db2358617e83818874db40a2"},
@@ -76,10 +91,62 @@ namespace {
         }
         return true;
     }
+
+    void ResetVerifiedImages() {
+        if (verifiedClient) FreeLibrary(verifiedClient);
+        if (verifiedCommon) FreeLibrary(verifiedCommon);
+        if (verifiedServer) FreeLibrary(verifiedServer);
+        if (verifiedMod) FreeLibrary(verifiedMod);
+        verifiedClient = verifiedCommon = verifiedServer = verifiedMod = nullptr;
+    }
+
+    // Caller holds the exclusive image lock, including during bootstrap.
+    bool VerifyCachedImageLocked(const wchar_t* name, const char* digest,
+                                 HMODULE& verified, std::string& error) {
+        if (imageDirectory.empty()) {
+            error = "Standalone executable not authenticated";
+            return false;
+        }
+        HMODULE loaded = GetModuleHandleW(name);
+        if (loaded && loaded == verified) return true;
+        if (verified) {
+            FreeLibrary(verified);
+            verified = nullptr;
+        }
+        HMODULE retained = nullptr;
+        if (!loaded || !GetModuleHandleExW(0, name, &retained)) {
+            error = "Missing, relocated or unrecognized loaded image";
+            return false;
+        }
+        if (retained != loaded || !VerifyImage(name, digest, error)) {
+            if (retained != loaded) error = "Missing, relocated or unrecognized loaded image";
+            FreeLibrary(retained);
+            return false;
+        }
+        verified = retained;
+        return true;
+    }
+
+    bool VerifyCachedImage(const wchar_t* name, const char* digest,
+                           HMODULE& verified, std::string& error) {
+        {
+            SharedImageLock lock;
+            if (imageDirectory.empty()) {
+                error = "Standalone executable not authenticated";
+                return false;
+            }
+            HMODULE loaded = GetModuleHandleW(name);
+            if (loaded && loaded == verified) return true;
+        }
+        ExclusiveImageLock lock;
+        return VerifyCachedImageLocked(name, digest, verified, error);
+    }
 }
 
 namespace LabProfile {
     bool LoadAndVerify(std::string& error) {
+        ExclusiveImageLock lock;
+        ResetVerifiedImages();
         imageDirectory.clear();
         std::wstring gamePath;
         if (!ModulePath(nullptr, gamePath)) { error = "Executable path unavailable"; return false; }
@@ -105,7 +172,13 @@ namespace LabProfile {
         }
         imageDirectory = directory;
         for (const auto& image : kImages) {
-            if (!VerifyImage(image.name, image.digest, error)) {
+            HMODULE* cached = nullptr;
+            if (&image == &kImages[1]) cached = &verifiedClient;
+            if (&image == &kImages[2]) cached = &verifiedCommon;
+            if (&image == &kImages[8]) cached = &verifiedMod;
+            if (!(cached ? VerifyCachedImageLocked(image.name, image.digest, *cached, error) :
+                    VerifyImage(image.name, image.digest, error))) {
+                ResetVerifiedImages();
                 imageDirectory.clear();
                 return false;
             }
@@ -114,16 +187,18 @@ namespace LabProfile {
     }
 
     bool VerifyClient(std::string& error) {
-        return VerifyImage(L"D2Client.dll", kImages[1].digest, error);
+        return VerifyCachedImage(L"D2Client.dll", kImages[1].digest, verifiedClient, error);
     }
     bool VerifyCommon(std::string& error) {
-        return VerifyImage(L"D2Common.dll", kImages[2].digest, error);
+        return VerifyCachedImage(L"D2Common.dll", kImages[2].digest, verifiedCommon, error);
     }
     bool VerifyServer(std::string& error) {
-        return VerifyImage(L"D2Game.dll",
-            "24b293b86f95bea0228826c502ea04737ba21b91ca9832e52aac4b11fef14f53", error);
+        return VerifyCachedImage(L"D2Game.dll",
+            "24b293b86f95bea0228826c502ea04737ba21b91ca9832e52aac4b11fef14f53",
+            verifiedServer, error);
     }
     bool BackendFileIdentity(std::string& digest) {
+        SharedImageLock lock;
         HMODULE module = nullptr;
         std::wstring path;
         if (imageDirectory.empty() ||
@@ -137,8 +212,10 @@ namespace LabProfile {
     bool ModFileIdentity(std::string& digest) {
         std::string error;
         digest.clear();
-        if (!VerifyImage(L"ProjectDiablo.dll", kImages[8].digest, error)) return false;
-        return HashFile(imageDirectory + L"ProjectDiablo.dll", digest);
+        if (!VerifyCachedImage(L"ProjectDiablo.dll", kImages[8].digest, verifiedMod, error))
+            return false;
+        digest = kImages[8].digest;
+        return true;
     }
     // The standalone variant never loads a lab profile or starts its MCP listener.
     const std::string& Token() { static const std::string empty; return empty; }

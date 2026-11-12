@@ -237,37 +237,48 @@ bool WssCorruptnumRange(const CubeMainTxt& recipe,
 }
 using WssCubeMainCount = int (__stdcall*)();
 using WssCubeMainRecord = CubeMainTxt* (__stdcall*)(int);
+using WssApplyProperty = void (__stdcall*)(UnitAny*, D2PropertyStrc*, DWORD);
+struct WssBindings {
+    WssCubeMainCount count = nullptr;
+    WssCubeMainRecord record = nullptr;
+    WssApplyProperty apply = nullptr;
+};
+WssBindings wssBindings;
 static_assert(sizeof(CubeMainTxt) == 0x148, "pinned S13 cube recipe stride");
 struct WssCubeMainTable {
     WssCubeMainCount count = nullptr;
     WssCubeMainRecord record = nullptr;
     DWORD total = 0;
 };
-bool WssLoadCubeMainTable(WssCubeMainTable& table,
-    std::string& error) {
+bool PrepareWssBindings(std::string& error) {
+    if (wssBindings.count && wssBindings.record && wssBindings.apply) return true;
+    if (!LabProfile::VerifyCommon(error)) return false;
     HMODULE module = GetModuleHandleA("D2Common.dll");
-    if (!module) {
-        error = "S13 D2Common module unavailable for CubeMain access";
-        return false;
-    }
-    FARPROC countExport = GetProcAddress(
-        module, MAKEINTRESOURCEA(10675));
-    FARPROC recordExport = GetProcAddress(
-        module, MAKEINTRESOURCEA(10783));
-    const BYTE* countCode =
-        reinterpret_cast<const BYTE*>(countExport);
-    const BYTE* recordCode =
-        reinterpret_cast<const BYTE*>(recordExport);
+    if (!module) { error = "S13 D2Common module unavailable"; return false; }
+    const FARPROC countExport = GetProcAddress(module, MAKEINTRESOURCEA(10675));
+    const FARPROC recordExport = GetProcAddress(module, MAKEINTRESOURCEA(10783));
+    const BYTE* countCode = reinterpret_cast<const BYTE*>(countExport);
+    const BYTE* recordCode = reinterpret_cast<const BYTE*>(recordExport);
+    const BYTE* property = reinterpret_cast<const BYTE*>(module) + 0x47730;
+    const BYTE propertySignature[] = {0x56,0x8b,0x74,0x24,0x08,0x85,0xf6};
     if (!Readable(countCode, 6) || !Readable(recordCode, 2) ||
         countCode[0] != 0xA1 || countCode[5] != 0xC3 ||
-        recordCode[0] != 0x8B || recordCode[1] != 0x0D) {
-        error = "S13 D2Common CubeMain count/record export signature mismatch";
+        recordCode[0] != 0x8B || recordCode[1] != 0x0D ||
+        !Readable(property, sizeof(propertySignature)) ||
+        memcmp(property, propertySignature, sizeof(propertySignature)) ||
+        reinterpret_cast<const BYTE*>(GetProcAddress(module, MAKEINTRESOURCEA(10914))) != property) {
+        error = "unrecognized S13 CubeMain bindings";
         return false;
     }
-    const auto count =
-        reinterpret_cast<WssCubeMainCount>(countExport);
-    const auto record =
-        reinterpret_cast<WssCubeMainRecord>(recordExport);
+    wssBindings = {reinterpret_cast<WssCubeMainCount>(countExport),
+        reinterpret_cast<WssCubeMainRecord>(recordExport),
+        reinterpret_cast<WssApplyProperty>(const_cast<BYTE*>(property))};
+    return true;
+}
+bool WssLoadCubeMainTable(WssCubeMainTable& table, std::string& error) {
+    if (!PrepareWssBindings(error)) return false;
+    const auto count = wssBindings.count;
+    const auto record = wssBindings.record;
     const int total = count();
     if (total <= 0 || total > 32768) {
         error = "S13 D2Common CubeMain record count is invalid";
@@ -318,10 +329,6 @@ bool WssFindRandomizer(const WssCubeMainTable& cube,
     const sgptDataTable* records, const D2ItemDataTbl* bases,
     UnitAny* item, int wssBaseId, unsigned& rowIndex,
     int& minimum, int& maximum, std::string& error) {
-    if (D2COMMON_GetUnitStat(item, STAT_CORRUPTOR, 0) != 0) {
-        error = "generated unique already has a WSS corruptor stat";
-        return false;
-    }
     for (DWORD index = 0; index < cube.total; ++index) {
         const CubeMainTxt* row = nullptr;
         if (!WssCubeMainRow(cube, index, row, error)) return false;
@@ -356,11 +363,6 @@ bool WssSelectCorruption(UnitAny* item, DWORD seed,
     }
     WssCubeMainTable cube;
     if (!WssLoadCubeMainTable(cube, error)) return false;
-    if (!item || !Readable(item->pItemData, sizeof(ItemData)) ||
-        item->pItemData->dwQuality != 7) {
-        error = "WSS corruption requires a validated quality-7 unique";
-        return false;
-    }
     const int wssBaseId = WssBaseId(bases);
     if (wssBaseId < 0) {
         error = "loaded S13 item table has no unique WSS base code";
@@ -476,17 +478,10 @@ json WssCorruptionJson(const WssCorruptionSelection& selected) {
 }
 bool ApplyWssCorruption(void* game, UnitAny* item, DWORD seed,
     WssCorruptionSelection& selected, std::string& error) {
-    if (!game || !Readable(static_cast<BYTE*>(game) + 0x70, sizeof(DWORD)) ||
-        !item || !Readable(item, sizeof(UnitAny)) ||
-        item->dwType != UNIT_ITEM ||
-        !Readable(item->pItemData, sizeof(ItemData)) ||
-        item->pItemData->dwQuality != 7 ||
-        D2COMMON_GetUnitStat(item, STAT_CORRUPTED, 0) ||
-        D2COMMON_GetUnitStat(item, STAT_CORRUPTOR, 0)) {
-        error = "WSS corruption requires an uncorrupted unique item and game";
+    if (!game || !item) {
+        error = "WSS corruption needs a live generated item and game";
         return false;
     }
-    const DWORD uniqueId = item->pItemData->dwFileIndex;
     if (!WssSelectCorruption(item, seed, selected, error)) return false;
     const DWORD propertyPool = *reinterpret_cast<const DWORD*>(
         static_cast<const BYTE*>(game) + 0x70);
@@ -494,118 +489,10 @@ bool ApplyWssCorruption(void* game, UnitAny* item, DWORD seed,
         error = "S13 native item property pool is unavailable";
         return false;
     }
-    std::string profileError;
-    if (!LabProfile::VerifyCommon(profileError)) {
-        error = "S13 D2Common verification failed: " + profileError;
-        return false;
-    }
-    HMODULE common = GetModuleHandleA("D2Common.dll");
-    const BYTE* entry = common ?
-        reinterpret_cast<const BYTE*>(common) + 0x47730 : nullptr;
-    const BYTE signature[] = {
-        0x56, 0x8b, 0x74, 0x24, 0x08, 0x85, 0xf6};
-    const FARPROC exported = common ?
-        GetProcAddress(common, MAKEINTRESOURCEA(10914)) : nullptr;
-    if (!entry || !Readable(entry, sizeof(signature)) ||
-        memcmp(entry, signature, sizeof(signature)) ||
-        reinterpret_cast<const BYTE*>(exported) != entry) {
-        error = "S13 D2Common CubeMain property function signature mismatch";
-        return false;
-    }
-    using ApplyProperty = void (__stdcall*)(
-        UnitAny*, D2PropertyStrc*, DWORD);
-    const auto apply = reinterpret_cast<ApplyProperty>(
-        const_cast<BYTE*>(entry));
+    const auto apply = wssBindings.apply;
     for (unsigned index = 0;
-         index < selected.output.propertyCount; ++index) {
+         index < selected.output.propertyCount; ++index)
         apply(item, &selected.output.properties[index].native, propertyPool);
-        if (!Readable(item->pItemData, sizeof(ItemData)) ||
-            item->pItemData->dwQuality != 7 ||
-            item->pItemData->dwFileIndex != uniqueId) {
-            error = "native WSS property application changed unique identity";
-            return false;
-        }
-    }
-    if (!RoguelikeLoot::IsWssCorruptedUnique(
-            static_cast<int>(item->pItemData->dwQuality),
-            D2COMMON_GetUnitStat(item, STAT_CORRUPTED, 0),
-            D2COMMON_GetUnitStat(item, STAT_CORRUPTOR, 0),
-            selected.output.marker)) {
-        error = "native S13 WSS marker or corruptnum did not materialize";
-        return false;
-    }
     error.clear();
-    return true;
-}
-bool NativeUniqueMatchesReward(int uniqueId, int baseId, int itemLevel,
-    int playerLevel, RoguelikeLoot::BaseKind baseKind, int charmSize,
-    int uniqueLevelBonus) {
-    D2ItemDataTbl* bases = nullptr;
-    sgptDataTable* records = nullptr;
-    if (!RewardTables(bases, records) || !records->dwUniqItemsRecs ||
-        records->dwUniqItemsRecs > 32768 || uniqueId < 0 ||
-        static_cast<DWORD>(uniqueId) >= records->dwUniqItemsRecs ||
-        !Readable(records->pUniqueItemsTxt,
-            size_t(records->dwUniqItemsRecs) * sizeof(UniqueItemsTxt)))
-        return false;
-    const UniqueItemsTxt& row = records->pUniqueItemsTxt[uniqueId];
-    const int matchingBase = MatchingRewardBase(bases, records, row.szCode,
-        itemLevel, playerLevel, baseKind, charmSize);
-    const RoguelikeLoot::NativeUniqueOutput output{
-        uniqueId, static_cast<int>(records->dwUniqItemsRecs),
-        matchingBase, baseId, static_cast<int>(row.wLvl),
-        static_cast<int>(row.wLvlReq), (row.dwUniqueItemFlags & 1) != 0};
-    return RoguelikeLoot::IsNativeUniqueOutputEligible(
-        output, itemLevel, playerLevel, uniqueLevelBonus);
-}
-bool ValidateRewardUnique(UnitAny* item, Pending& reward, int itemLevel,
-    int playerLevel, RoguelikeLoot::BaseKind baseKind, int charmSize,
-    int uniqueLevelBonus, bool corruptedUnique,
-    const WssCorruptionSelection* corruption,
-    json& result, std::string& error) {
-    if (!item || !Readable(item, sizeof(UnitAny)) ||
-        item->dwType != UNIT_ITEM ||
-        !Readable(item->pItemData, sizeof(ItemData)) ||
-        item->pItemData->dwQuality != 7 ||
-        item->pItemData->dwFileIndex >= 32768) {
-        error = "generated Roguelike reward is not a valid unique item";
-        return false;
-    }
-    const int uniqueId = static_cast<int>(item->pItemData->dwFileIndex);
-    if (!NativeUniqueMatchesReward(uniqueId, reward.baseId, itemLevel,
-            playerLevel, baseKind, charmSize, uniqueLevelBonus)) {
-        error = "native unique identity is not eligible for this base and level";
-        return false;
-    }
-    if (uniqueId != reward.uniqueId) {
-        error = "generated unique identity changed";
-        return false;
-    }
-    // Selection avoids prior unique IDs until no eligible alternative remains;
-    // repeating an exhausted low-level pool is preferable to dropping nothing.
-    result["item_level"] = item->pItemData->dwItemLevel;
-    result["unique_id"] = uniqueId;
-    const int corrupted = D2COMMON_GetUnitStat(item, STAT_CORRUPTED, 0);
-    const int corruptor = D2COMMON_GetUnitStat(item, STAT_CORRUPTOR, 0);
-    if (!corruptedUnique) {
-        if (corrupted || corruptor) {
-            error = "chest unique unexpectedly retained WSS corruption markers";
-            return false;
-        }
-        result["corrupted"] = false;
-        return true;
-    }
-    if (!corruption ||
-        !RoguelikeLoot::IsWssCorruptedUnique(
-            static_cast<int>(item->pItemData->dwQuality),
-            corrupted, corruptor, corruption->output.marker) ||
-        corruption->output.corruptor != 1001 ||
-        !corruption->output.effectCount ||
-        !corruption->output.allChancesCertain) {
-        error = "generated unique did not retain its loaded S13 WSS outcome";
-        return false;
-    }
-    result["corrupted"] = true;
-    result["corruption"] = WssCorruptionJson(*corruption);
     return true;
 }
