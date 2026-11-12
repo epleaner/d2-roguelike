@@ -1,0 +1,7 @@
+Standalone Roguelike BH corresponding source
+Pinned BH upstream: https://github.com/bethington/d2-mod-toolkit.git @ 3a91b6306b8673bedc07d8e78c8bc5d17c75ba4a
+BH source: AGPL-3.0-or-later (LICENSE.md). Reused D2Ex2 source: Apache-2.0 (APACHE LICENSE 2.0.md). Preserve the notices in BH and ThirdParty.
+Detours source: https://github.com/microsoft/Detours.git @ e4bfd6b03e50de46b47abfbd1e46b384f0c5f833 (MIT).
+Build BH/BH.vcxproj with MSBuild 17, Release|Win32, v143 and Windows SDK 10.0.26100; the project compiles the included Detours source.
+This archive contains toolkit sources and upstream build dependencies; it contains no Diablo II or Project Diablo II game files.
+Intended for offline single-player. This build does not prevent connecting to PD2 Online; using the mod online may risk your account.
