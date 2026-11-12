@@ -28,6 +28,7 @@
 #include <string_view>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -1914,8 +1915,10 @@ bool RoguelikeMonsterDropContext(void* game, Drop* drop, int& area) {
          zoneSlots[area].kind == Pending::ZoneKind::Boss);
 }
 bool ApplyRunDropIdentificationPolicy(UnitAny* item) {
-    if (!Readable(item, sizeof(UnitAny)) || item->dwType != UNIT_ITEM ||
-        !Readable(item->pItemData, sizeof(ItemData)))
+    if (!Readable(item, offsetof(UnitAny, pItemData) + sizeof(item->pItemData)) ||
+        item->dwType != UNIT_ITEM ||
+        !Readable(item->pItemData, offsetof(ItemData, dwFlags) +
+            sizeof(item->pItemData->dwFlags)))
         return false;
     const bool identified = RoguelikeLoot::ShouldIdentifyDrop(
         item->pItemData->dwQuality);
@@ -3262,29 +3265,46 @@ bool UpdateLevelRow(LevelsTxt& row, const LevelsTxt& expected) {
     // The write already occurred; never claim a successful configuration.
     return false;
 }
-bool ResetZoneRows(std::string& error) {
-    if (zoneRows && !Readable(zoneRows, 255 * sizeof(LevelsTxt))) {
-        error = "prior game level table became unreadable"; return false;
+bool RestoreOwnedZoneRows(std::string& error, void* currentGame,
+    std::string_view currentEpoch) {
+    if (!zoneRows) return true;
+    sgptDataTable* tables = Tables();
+    if (!tables || !tables->pLevelsTxt || tables->dwLevelsRecs < 255 ||
+        tables->dwLevelsRecs > 1024 ||
+        !Readable(tables->pLevelsTxt, 255 * sizeof(LevelsTxt))) {
+        error = "current game level table is unavailable"; return false;
     }
-    if (zoneRows) {
-        for (int i = 13; i <= 254; ++i) {
-            const ZoneSlot& slot = zoneSlots[i];
-            if (!slot.configured) continue;
-            const LevelsTxt& current = zoneRows[i];
-            if (std::memcmp(&current, &slot.configuredRow, sizeof(LevelsTxt)) &&
-                std::memcmp(&current, &slot.original, sizeof(LevelsTxt))) {
-                error = "prior cave row changed unexpectedly"; return false;
-            }
+    if (zoneRows != tables->pLevelsTxt) {
+        if (currentGame && currentGame == zoneGame &&
+            currentEpoch == std::string_view(zoneEpoch)) {
+            error = "active game level table changed unexpectedly"; return false;
         }
-        for (int i = 13; i <= 254; ++i) {
-            const ZoneSlot& slot = zoneSlots[i];
-            if (slot.configured &&
-                std::memcmp(&zoneRows[i], &slot.original, sizeof(LevelsTxt)) &&
-                !UpdateLevelRow(zoneRows[i], slot.original)) {
-                error = "cannot restore prior game's cave row"; return false;
-            }
+        // The owning session ended and its table was replaced: never inspect
+        // or write the stale address, which may already contain unrelated data.
+        return true;
+    }
+    for (int i = 13; i <= 254; ++i) {
+        const ZoneSlot& slot = zoneSlots[i];
+        if (!slot.configured) continue;
+        const LevelsTxt& current = zoneRows[i];
+        if (std::memcmp(&current, &slot.configuredRow, sizeof(LevelsTxt)) &&
+            std::memcmp(&current, &slot.original, sizeof(LevelsTxt))) {
+            error = "prior cave row changed unexpectedly"; return false;
         }
     }
+    for (int i = 13; i <= 254; ++i) {
+        const ZoneSlot& slot = zoneSlots[i];
+        if (slot.configured &&
+            std::memcmp(&zoneRows[i], &slot.original, sizeof(LevelsTxt)) &&
+            !UpdateLevelRow(zoneRows[i], slot.original)) {
+            error = "cannot restore prior game's cave row"; return false;
+        }
+    }
+    return true;
+}
+bool ResetZoneRows(std::string& error, void* currentGame,
+    std::string_view currentEpoch) {
+    if (!RestoreOwnedZoneRows(error, currentGame, currentEpoch)) return false;
     zoneSlots = {};
     zoneRows = nullptr;
     zoneGame = nullptr;
@@ -4088,7 +4108,7 @@ json ConfigureZone(void* game, UnitAny* player, const Pending& request) {
         return Failure("selected boss record is no longer spawnable");
     if (zoneEpoch != request.expectedEpoch) {
         std::string error;
-        if (!ResetZoneRows(error)) return Failure(error);
+        if (!ResetZoneRows(error, game, request.expectedEpoch)) return Failure(error);
         zoneRows = table->pLevelsTxt;
         zoneEpoch = request.expectedEpoch;
         zoneGame = game;
@@ -7044,7 +7064,7 @@ json StartTownRun(void* game, UnitAny* player) {
     const json portalCleanup = RemoveRunOwnedObjects(game, player);
     if (!portalCleanup.value("ok", false))
         return Failure("previous run portal cleanup uncertain: " + portalCleanup.dump());
-    if (!ResetZoneRows(error))
+    if (!ResetZoneRows(error, game, epoch))
         return Failure("prior run zone restoration failed: " + error);
     error.clear();
     const std::uint64_t entrySerial = ++runEntrySerial;
@@ -7093,7 +7113,7 @@ json StartTownRun(void* game, UnitAny* player) {
             error = configured.value("error",
                 std::string("configuration failed"));
             std::string restoreError;
-            if (!ResetZoneRows(restoreError))
+            if (!ResetZoneRows(restoreError, game, epoch))
                 error += "; zone restoration uncertain: " + restoreError;
             return Failure("run root configuration failed: " + error);
         }
@@ -8964,7 +8984,7 @@ void RestoreRoguelikeZones(bool saveSnapshot) {
     }
     ServerMonsters::Clear();
     std::string error;
-    if (!ResetZoneRows(error))
+    if (!ResetZoneRows(error, nullptr, {}))
         OutputDebugStringA(("Roguelike cave TXT restoration rejected: " + error + "\n").c_str());
     if (saveSnapshot) ForgetRunOwnedObjects();
 }
