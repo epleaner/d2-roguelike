@@ -8,7 +8,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from standalone import install, releases
+from standalone import install
 
 
 class Launcher(tk.Tk):
@@ -19,7 +19,7 @@ class Launcher(tk.Tk):
         self.columnconfigure(0, weight=1)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.folder = tk.StringVar()
-        self.status = tk.StringVar(value="Select the PD2 folder you want the launcher to modify.")
+        self.status = tk.StringVar(value="Select the PD2 folder; Play installs or updates the mod automatically.")
         self.events = queue.Queue()
         self.busy = False
 
@@ -40,17 +40,12 @@ class Launcher(tk.Tk):
         self.folder_button.grid(row=3, column=1, padx=(8, 0), pady=(3, 12))
         buttons = ttk.Frame(frame)
         buttons.grid(row=4, column=0, columnspan=2, sticky="w")
-        self.install_button = ttk.Button(buttons, text="Install / Update", command=self.update_mod)
-        self.install_button.grid(row=0, column=0, padx=(0, 8))
         self.play_button = ttk.Button(buttons, text="Play", command=self.play)
-        self.play_button.grid(row=0, column=1, padx=(0, 8))
-        self.recover_button = ttk.Button(buttons, text="Recover interrupted update", command=self.recover)
-        self.recover_button.grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(buttons, text="Licenses", command=self.show_licenses).grid(row=0, column=3)
+        self.play_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Button(buttons, text="Licenses", command=self.show_licenses).grid(row=0, column=1)
         ttk.Label(frame, textvariable=self.status, wraplength=540, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        self.controls = (self.folder_entry, self.folder_button,
-                         self.install_button, self.play_button, self.recover_button)
+        self.controls = (self.folder_entry, self.folder_button, self.play_button)
         self._initial_paths()
         self.after(100, self._deliver)
 
@@ -138,23 +133,12 @@ class Launcher(tk.Tk):
             pass
         self.after(100, self._deliver)
 
-    def update_mod(self):
-        def operation(folder):
-            # Validate the selected folder before fetching or changing its files.
-            install.inspect(folder)
-            release = releases.latest()
-            return install.install(folder, releases.download(release))
-        self._run("Checking the latest release and installing it into the selected folder…", operation,
-                  lambda state: f"Roguelike {state['version']} is installed. Choose Play, then Single Player.")
-
     def play(self):
-        self._run("Starting your Roguelike installation…", install.launch,
-                  lambda pid: "Choose Single Player. Online play is not blocked and may risk your account.")
-
-    def recover(self):
-        self._run("Recovering the interrupted update…", install.recover,
-                  lambda changed: "Previous update rolled back. You can install again." if changed
-                  else "There is no interrupted update to recover.")
+        self._run("Checking for updates and starting your Roguelike installation…",
+                  install.play,
+                  lambda result: "Choose Single Player. Online play is not blocked and may risk your account."
+                  if result[1] else
+                  "Update unavailable; started the installed version. Choose Single Player.")
 
 
 def main():

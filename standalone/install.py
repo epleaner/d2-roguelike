@@ -12,8 +12,9 @@ import stat
 import subprocess
 import tempfile
 import uuid
+from urllib.error import URLError
 
-from standalone import mod_data_plan
+from standalone import mod_data_plan, releases
 from standalone.releases import Package
 
 
@@ -545,3 +546,17 @@ def launch(folder: Path) -> int:
         process = subprocess.Popen([str(project / "Game.exe"), "-3dfx", "-direct", "-txt"],
                                    cwd=project, close_fds=True)
         return process.pid
+
+
+def play(folder: Path) -> tuple[int, bool]:
+    """Recover, update and launch; preserve offline play for an existing install."""
+    recover(folder)
+    state = inspect(folder)
+    try:
+        package = releases.download(releases.latest())
+    except (URLError, TimeoutError, ConnectionError):
+        if not state.get("installed"):
+            raise
+        return launch(folder), False
+    install(folder, package)
+    return launch(folder), True
