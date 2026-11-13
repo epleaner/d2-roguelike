@@ -15,19 +15,25 @@ class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("PD2 Roguelike")
-        self.minsize(600, 360)
+        self.minsize(600, 420)
         self.columnconfigure(0, weight=1)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.folder = tk.StringVar()
         self.status = tk.StringVar(value="Select the PD2 folder; Play installs or updates the mod automatically.")
         self.events = queue.Queue()
         self.busy = False
+        assets = Path(__file__).resolve().parent / "assets"
+        self.portal_image = tk.PhotoImage(file=str(assets / "red-portal.png")).subsample(3, 3)
+        self.iconbitmap(default=str(assets / "red-portal.ico"))
 
         frame = ttk.Frame(self, padding=18)
         frame.grid(sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        ttk.Label(frame, text="PD2 Roguelike", font=("TkDefaultFont", 18, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        heading = ttk.Frame(frame)
+        heading.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(heading, image=self.portal_image).grid(row=0, column=0, padx=(0, 12))
+        ttk.Label(heading, text="PD2 Roguelike", font=("TkDefaultFont", 18, "bold")).grid(
+            row=0, column=1, sticky="w")
         ttk.Label(frame, text="Single Player only • PD2 Season 13 patch 2\n"
                               "The selected folder will be modified. Copy PD2 first to protect your original.\n"
                               "This does not block PD2 Online; using the mod online may risk your account.\n"
@@ -65,7 +71,7 @@ class Launcher(tk.Tk):
         try:
             names = ("Python.txt", "PyInstaller.txt", "OpenSSL.txt", "zlib.txt",
                      "StormLib.txt", "StormLib-components.txt", "BH-AGPL.txt", "BH-Apache.txt",
-                     "Native-components.txt")
+                     "Native-components.txt", "Portal-art.txt")
             notices = [(name, (directory / name).read_text(encoding="utf-8")) for name in names]
         except (OSError, UnicodeError, ValueError) as error:
             messagebox.showerror("PD2 Roguelike", str(error), parent=self)

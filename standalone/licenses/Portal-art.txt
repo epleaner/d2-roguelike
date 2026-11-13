@@ -1,0 +1,9 @@
+Red portal artwork
+
+The original vector artwork was generated with Recraft V4.1 Vector through the
+OpenRouter API, without an input image. The PNG and Windows icon are derived
+from that vector.
+
+Recraft's API asset terms assign rights to the API user and restrict using
+generated assets to train AI models, systems, or networks. See:
+https://www.recraft.ai/docs/trust-and-security/ownership

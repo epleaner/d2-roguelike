@@ -24,7 +24,9 @@ SOURCE_FILES = (
     "standalone/licenses/OpenSSL.txt", "standalone/licenses/zlib.txt",
     "standalone/licenses/StormLib.txt", "standalone/licenses/StormLib-components.txt",
     "standalone/licenses/BH-AGPL.txt", "standalone/licenses/BH-Apache.txt",
-    "standalone/licenses/Native-components.txt",
+    "standalone/licenses/Native-components.txt", "standalone/licenses/Portal-art.txt",
+    "standalone/assets/red-portal.svg", "standalone/assets/red-portal.png",
+    "standalone/assets/red-portal.ico",
 )
 
 
@@ -51,6 +53,7 @@ def build(stormlib: Path, output: Path) -> dict:
         if hashlib.file_digest(stream, "sha256").hexdigest() != STORMLIB_SHA256:
             raise ValueError("StormLib must be the verified 9.40 amd64 Release ANSI DLL")
     licenses = ROOT / "standalone/licenses"
+    assets = ROOT / "standalone/assets"
     sources = source_hashes()
     output = Path(output).absolute()
     output.mkdir(parents=False, exist_ok=False)
@@ -59,10 +62,13 @@ def build(stormlib: Path, output: Path) -> dict:
             temporary = Path(temporary)
             env = os.environ.copy()
             env["PYINSTALLER_CONFIG_DIR"] = str(temporary / "config")
+            # PyInstaller places the entry-point module at the bundle root.
             command = [sys.executable, "-m", "PyInstaller", "--onefile", "--windowed",
-                       "--name", "PD2-Roguelike", "--paths", str(ROOT),
-                       "--paths", str(ROOT / "scripts"), "--add-binary", str(stormlib) + ";.",
-                       "--add-data", str(licenses) + ";standalone/licenses",
+                       "--name", "PD2-Roguelike", "--icon", str(assets / "red-portal.ico"),
+                       "--paths", str(ROOT), "--paths", str(ROOT / "scripts"),
+                       "--add-binary", str(stormlib) + ";.",
+                       "--add-data", str(licenses) + ";licenses",
+                       "--add-data", str(assets) + ";assets",
                        "--workpath", str(temporary / "build"), "--distpath", str(output),
                        "--specpath", str(temporary), str(ROOT / "standalone/launcher.py")]
             subprocess.run(command, env=env, check=True)
