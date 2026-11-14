@@ -16,8 +16,14 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 STORMLIB_SHA256 = "88eac929abe2c16503778f3fd44aa567670e9025349925ded8153682e0eb0167"
+ARTWORK_SHA256 = {
+    "red-portal.png": "0b1ba7a4ef6997df642266a0d411c8bb94cca595c57d5939ba36c593586d4991",
+    "red-portal.ico": "db6e3b87f6e9404e02bb1708f9634d21c867d08a340cefd59d5a1ea6220dd25f",
+}
 SOURCE_FILES = (
     "scripts/build_roguelike_launcher.py", "scripts/mod_archive.py", "scripts/mod_data.py",
+    "scripts/prepare_roguelike_artwork.py", "scripts/portal_art/main.go", "scripts/portal_art/main_test.go",
+    "scripts/portal_art/go.mod", "scripts/portal_art/go.sum", "scripts/portal_art/LICENSE",
     "scripts/mod_strings.py", "standalone/install.py", "standalone/launcher.py",
     "standalone/mod_data_plan.py", "standalone/releases.py",
     "standalone/licenses/Python.txt", "standalone/licenses/PyInstaller.txt",
@@ -25,8 +31,6 @@ SOURCE_FILES = (
     "standalone/licenses/StormLib.txt", "standalone/licenses/StormLib-components.txt",
     "standalone/licenses/BH-AGPL.txt", "standalone/licenses/BH-Apache.txt",
     "standalone/licenses/Native-components.txt", "standalone/licenses/Portal-art.txt",
-    "standalone/assets/red-portal.svg", "standalone/assets/red-portal.png",
-    "standalone/assets/red-portal.ico",
 )
 
 
@@ -38,7 +42,17 @@ def source_hashes() -> dict[str, str]:
     return result
 
 
-def build(stormlib: Path, output: Path) -> dict:
+def artwork_hashes(directory: Path) -> dict[str, str]:
+    result = {}
+    for name in ARTWORK_SHA256:
+        with (directory / name).open("rb") as stream:
+            result[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    if result != ARTWORK_SHA256:
+        raise ValueError("Launcher artwork does not match the approved portal image")
+    return result
+
+
+def build(stormlib: Path, artwork: Path, output: Path) -> dict:
     if os.name != "nt" or struct.calcsize("P") != 8 or sys.version_info[:3] != (3, 12, 10):
         raise RuntimeError("Build with the verified Windows x64 Python 3.12.10 environment")
     if importlib.metadata.version("pyinstaller") != "6.16.0":
@@ -53,7 +67,8 @@ def build(stormlib: Path, output: Path) -> dict:
         if hashlib.file_digest(stream, "sha256").hexdigest() != STORMLIB_SHA256:
             raise ValueError("StormLib must be the verified 9.40 amd64 Release ANSI DLL")
     licenses = ROOT / "standalone/licenses"
-    assets = ROOT / "standalone/assets"
+    assets = Path(artwork).resolve(strict=True)
+    artwork_digest = artwork_hashes(assets)
     sources = source_hashes()
     output = Path(output).absolute()
     output.mkdir(parents=False, exist_ok=False)
@@ -68,7 +83,8 @@ def build(stormlib: Path, output: Path) -> dict:
                        "--paths", str(ROOT), "--paths", str(ROOT / "scripts"),
                        "--add-binary", str(stormlib) + ";.",
                        "--add-data", str(licenses) + ";licenses",
-                       "--add-data", str(assets) + ";assets",
+                       "--add-data", str(assets / "red-portal.png") + ";assets",
+                       "--add-data", str(assets / "red-portal.ico") + ";assets",
                        "--workpath", str(temporary / "build"), "--distpath", str(output),
                        "--specpath", str(temporary), str(ROOT / "standalone/launcher.py")]
             subprocess.run(command, env=env, check=True)
@@ -77,9 +93,10 @@ def build(stormlib: Path, output: Path) -> dict:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         if source_hashes() != sources:
             raise RuntimeError("Launcher sources changed during the build")
-        receipt = {"schema_version": 1, "bytes": executable.stat().st_size, "sha256": digest,
+        artwork_hashes(assets)
+        receipt = {"schema_version": 2, "bytes": executable.stat().st_size, "sha256": digest,
                    "python": "3.12.10-x64", "tcl": "8.6.15", "pyinstaller": "6.16.0",
-                   "stormlib_sha256": STORMLIB_SHA256, "sources": sources}
+                   "stormlib_sha256": STORMLIB_SHA256, "sources": sources, "artwork": artwork_digest}
         (output / "launcher-receipt.json").write_text(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return {"path": str(executable), **receipt}
@@ -93,8 +110,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stormlib", required=True, type=Path, help="Verified StormLib.dll")
     parser.add_argument("--output", required=True, type=Path, help="New output directory")
+    parser.add_argument("--artwork", required=True, type=Path, help="Private directory containing the approved PNG and ICO")
     args = parser.parse_args()
-    print(json.dumps(build(args.stormlib, args.output), indent=2))
+    print(json.dumps(build(args.stormlib, args.artwork, args.output), indent=2))
 
 
 if __name__ == "__main__":

@@ -1,9 +1,8 @@
 Red portal artwork
 
-The original vector artwork was generated with Recraft V4.1 Vector through the
-OpenRouter API, without an input image. The PNG and Windows icon are derived
-from that vector.
+The portal image is derived from the original Diablo II game artwork.
+Diablo II and its content are copyright Blizzard Entertainment, Inc.
+All rights reserved.
 
-Recraft's API asset terms assign rights to the API user and restrict using
-generated assets to train AI models, systems, or networks. See:
-https://www.recraft.ai/docs/trust-and-security/ownership
+This fan-made launcher is not affiliated with or endorsed by Blizzard.
+The corresponding source archive does not include the game artwork.
