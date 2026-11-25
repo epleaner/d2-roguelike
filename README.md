@@ -8,6 +8,7 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 
 ## The run
 
+- The Rogue Encampment is a hub with no wilderness exit. Use the Abyss entrance to start or resume a run.
 - After a combat clear, pick from up to three one-way portals. Combat portal labels show the encounter, area level, modifiers, and reward.
 - Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
 - Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests.
@@ -65,7 +66,7 @@ The Roguelike launcher does **not** automatically modify your selected filter or
 4. Run the launcher and select the copied folder if it isn't already selected. Click **Play**. The first install needs an internet connection.
 5. Choose **Single Player**. The entrance appears automatically in town. Click **Enter the Abyss** to begin.
 
-Windows may warn about the launcher because it is unsigned. If you have an older Roguelike launcher, download the new executable; it cannot update itself.
+Windows may warn about the launcher because it is unsigned. **If you have v0.8.2 or earlier, download the new executable:** older launchers cannot install this update or update themselves.
 
 ## Save and resume
 

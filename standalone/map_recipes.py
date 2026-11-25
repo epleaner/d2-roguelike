@@ -244,7 +244,7 @@ DATA = json.loads(r'''
       "output": {
         "bytes": 56983,
         "path": "data/global/tiles/Act1/Town/TownE1.ds1",
-        "sha256": "87898a16977c23612f3b939562d787971b0733326ca20a84150be366cea08840"
+        "sha256": "8fca7caf0c680a310af1e34797bc8e9ef9370e8890a383a00faaab46c1338027"
       },
       "operation": "town",
       "walls": []
@@ -257,7 +257,7 @@ DATA = json.loads(r'''
       "output": {
         "bytes": 56956,
         "path": "data/global/tiles/Act1/Town/TownN1.ds1",
-        "sha256": "c9c6d7f502f909d71affd815bdc3bfd32423377657c6fd85557018a710bad1c7"
+        "sha256": "889399d6288e155cf274d6734633b66109709912980bc94b59e4d69ad6d4f07e"
       },
       "operation": "town_north",
       "walls": []
@@ -270,7 +270,7 @@ DATA = json.loads(r'''
       "output": {
         "bytes": 56956,
         "path": "data/global/tiles/Act1/Town/TownS1.ds1",
-        "sha256": "659f7a5e662a3107217aea0fe1bdd2a120e8498d15eedb4a2be76160150cc2b7"
+        "sha256": "200f484d8897277e1b4a5a6c7c5ec92eb7a2e98c2af84187baef7a615c59f2ae"
       },
       "operation": "town",
       "walls": []
@@ -283,7 +283,7 @@ DATA = json.loads(r'''
       "output": {
         "bytes": 56956,
         "path": "data/global/tiles/Act1/Town/TownW1.ds1",
-        "sha256": "7bb86e9d083334963eb20645d5fffed71c4e71090f9285a4144a5e43b13e7732"
+        "sha256": "72b9fb0bd5e29ad0ac7c9bfa56aa0e8bee5edc4d4c91e1838064339b9980ab19"
       },
       "operation": "town",
       "walls": []

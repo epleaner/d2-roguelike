@@ -105,6 +105,28 @@ def _layout(source: bytes):
     return width, height, wall_offsets, count_offset, objects, end_objects, path_count_offset, path_owners
 
 
+def seal_town(source: bytes) -> bytes:
+    """Mark the outside two tile rows as impassable without changing artwork."""
+    width, height, walls, count_offset, *_ = _layout(source)
+    if (width, height, len(walls)) != (57, 41, 2):
+        raise ValueError("Unsupported town collision layout")
+    cells = width * height
+    floor = walls[-1][1] + cells * 4
+    if count_offset != floor + 2 * cells * 4:
+        raise ValueError("Unsupported town floor layers")
+    output = bytearray(source)
+    for y in range(height - 1):
+        for x in range(width - 1):
+            if 2 <= x < width - 3 and 2 <= y < height - 3:
+                continue
+            offset = floor + (y * width + x) * 4
+            value = struct.unpack_from("<I", source, offset)[0]
+            if not value:
+                raise ValueError("Town boundary has an empty floor cell")
+            struct.pack_into("<I", output, offset, value | 0x20000)
+    return bytes(output)
+
+
 def reconstruct(source: bytes, operation: str, wall_cells: list[list[int]]) -> bytes:
     """Apply only object filtering and complete wall-cell removal, never binary deltas."""
     if operation == "copy":

@@ -27,6 +27,9 @@ ARENA_PATH = "data/global/tiles/Act1/Outdoors/RogueTower13.ds1"
 TOWER_MEMBER = r"data\global\tiles\Act1\Outdoors\Tower2.ds1"
 _ARENA_RECORD = {"path": ARENA_PATH, "bytes": 1383, "sha256": TOWER_OUTPUT_SHA256}
 _MAP_RECIPES = map_recipes.DATA["recipes"]
+_SEALED_TOWN_MAPS = frozenset(
+    f"data/global/tiles/Act1/Town/Town{direction}1.ds1" for direction in "NESW"
+)
 _MAP_RECORDS = [_ARENA_RECORD, *(recipe["output"] for recipe in _MAP_RECIPES.values())]
 _MAP_RECORDS.sort(key=lambda record: record["path"])
 _ARCHIVE_BYTES = {"d2data.mpq": 269191615, "d2exp.mpq": 250156780,
@@ -210,6 +213,8 @@ def _map_assets(classic_archive, expansion_archive, patch_archive, maps_archive)
                 if (len(source), mod_data._hash(source)) != (recipe["sourceBytes"], recipe["sourceSha"]):
                     raise ValueError("Authenticated map member differs: " + output)
                 derived = ds1_reconstruct.reconstruct(source, recipe["operation"], recipe["walls"])
+                if output in _SEALED_TOWN_MAPS:
+                    derived = ds1_reconstruct.seal_town(derived)
                 record = recipe["output"]
                 if (len(derived), mod_data._hash(derived)) != (record["bytes"], record["sha256"]):
                     raise ValueError("Derived map differs from pinned revision: " + output)
