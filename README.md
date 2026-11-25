@@ -14,7 +14,7 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 - Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests.
 - Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms.
 - Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
-- The number of monsters remaining appears in chat after a kill.
+- After a kill, chat shows how many monsters remain, until the area is clear.
 
 Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs; the available auras expand as your character gains levels.
 

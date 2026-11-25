@@ -9065,11 +9065,12 @@ void FlushRemainingMonstersChat() {
     if (!remainingMonstersChat.compare_exchange_strong(
             notice, 0, std::memory_order_acq_rel)) return;
     const unsigned remaining = static_cast<unsigned>(notice) - 1;
+    if (!remaining) return;
     wchar_t text[48];
     if (std::swprintf(text, sizeof(text) / sizeof(text[0]),
             remaining == 1 ? L"%u monster remains" : L"%u monsters remain",
             remaining) > 0)
-        D2CLIENT_PrintGameString(text, 0);
+        D2CLIENT_PrintGameString(text, Grey);
 }
 void ReportRemainingMonsters(void* game, int level, UnitAny* defender) {
     if (!runPopulationReady[level] || !Readable(defender->pMonsterData, sizeof(*defender->pMonsterData)) ||
