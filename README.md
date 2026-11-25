@@ -16,6 +16,36 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 
 Softcore death ends the run and resets character progression to level one. Normal corpse and gold penalties still apply. The current pool of areas is finite.
 
+## Roguelike items
+
+**Talisman of Transmutation** (`rrl`) rerolls one unopened portal. Right-click it, then click the portal you want to change.
+
+**Edicts** work the same way, but let you choose what the new offer focuses on:
+
+| Item | Code | Rerolls the portal toward |
+| --- | --- | --- |
+| Overlord's Edict | `qbs` | A boss zone |
+| Mercantile Edict | `qmt` | A market |
+| Sanctuary Edict | `qsh` | A shrine zone |
+| Plunderer's Edict | `qch` | A locked-chest zone |
+| Armorer's Edict | `qeq` | Equipment rewards |
+| Collector's Edict | `qso` | Socketed gear, gems, runes, and jewels |
+| Relic Hunter's Edict | `qun` | Unique equipment |
+| Regalia Edict | `qse` | Set equipment |
+| Jeweler's Edict | `qjw` | Rings and amulets |
+| Charmwright's Edict | `qcm` | Charms |
+
+**Aura elixirs** grant a level-30 Paladin aura for 30 seconds. Akara can stock them, and they can also drop. Each is named “Elixir of” followed by its aura:
+
+- Might `ra1`, Prayer `rpr`, Resist Fire `ra2`, Holy Fire `ra3`, Thorns `ra4`
+- Defiance `ra5`, Resist Cold `ra6`, Blessed Aim `ra7`, Cleansing `ra8`, Resist Lightning `ra9`
+- Concentration `rb1`, Holy Freeze `rb2`, Vigor `rb3`, Holy Shock `rb4`, Sanctuary `rb5`
+- Meditation `rb6`, Fanaticism `rb7`, Conviction `rb8`, Redemption `rb9`, Salvation `rc1`
+
+### Loot filters
+
+The default filter has no hide rules. A third-party filter may hide or rename these items: elixirs use the healing-potion item type, while Talismans and Edicts use the scroll type. If an item is missing, try the **Show All Items** filter level or turn off the loot filter. To keep a custom filter, add rules for the item codes above before any matching hide rules. See the [PD2 filter guide](https://wiki.projectdiablo2.com/wiki/Item_Filtering) for syntax and rule order.
+
 ## Install
 
 1. Install classic Diablo II: Lord of Destruction and **Project Diablo 2 Season 14 Patch #2** on Windows. Other PD2 patches and Diablo II: Resurrected are not supported.
