@@ -2111,7 +2111,7 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
         if (!RoguelikeLoot::ChestNaturalDropAllowed(
                 drop->quality, potion))
             return nullptr;
-        return originalNaturalDrop(game, drop, flags);
+        return NativeCombatDrop(game, drop, flags, false);
     }
     int area = -1;
     if (!RoguelikeMonsterDropContext(game, drop, area))
@@ -7887,6 +7887,7 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
             runDropError = "chest unique exclusion history is full";
             continue;
         }
+        std::minstd_rand random(entropy ? entropy : 1);
         for (unsigned rewardIndex = 0; rewardIndex < rewardCount; ++rewardIndex) {
             const DWORD rewardSeed = entropy ^
                 (0x9e3779b9u * (rewardIndex + 1));
@@ -7894,7 +7895,8 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
                 playerLevel, 7, false, rewardSeed, 0, nullptr,
                 RoguelikeLoot::BaseKind::Equipment, 0, false,
                 RoguelikeLoot::kChestUniqueSearchBonus,
-                uniqueIds.data(), uniqueCount);
+                uniqueIds.data(), uniqueCount, false, false, &random);
+            if (reward.value("omitted", false)) continue;
             if (!reward.value("ok", false)) {
                 ReportRunDropFailure(game, player, reward);
                 if (!runError.empty()) return;
