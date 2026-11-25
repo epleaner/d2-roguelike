@@ -13,8 +13,8 @@ constexpr bool IsUberName(std::string_view name) noexcept {
 }
 
 constexpr bool IsUberClass(int classId) noexcept {
-    // Pinned v17 S13 MonStats indices: Diablo Clone, Ubers, Uber Diablo, and
-    // Uber Ancients. Their localized names are not consistently identifiable.
+    // S14 Patch #2 MonStats hcIdx values retain the S13 Id/NameStr pairs
+    // for Diablo Clone, Ubers, Uber Diablo, and Uber Ancients.
     return classId == 333 || classId == 789 ||
         (classId >= 704 && classId <= 709) ||
         (classId >= 989 && classId <= 991);

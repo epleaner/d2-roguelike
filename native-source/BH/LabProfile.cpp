@@ -31,11 +31,11 @@ namespace {
         {L"D2Client.dll", "dd8bc6025de921216a97c17f97cd1a50fbb85926e838ec60e13451448836d906"},
         {L"D2Common.dll", "59fa5928522f566f2bf99675571206ad70df889c89d3d07fa87edf5083e06e10"},
         {L"D2Net.dll", "99af2f04a87fdbd91810be963df9c365cef529ae22e6a345193ba5018e9910c9"},
-        {L"D2Win.dll", "ff5cbb956f1a419e0e76fc2df3be21065bbba894770b8de7cce8bc55ec453736"},
+        {L"D2Win.dll", "ae367dbe0f0c2cccd7c317ce84601bba9745c06a199767aa55caeab2d45dc442"},
         {L"D2Launch.dll", "99cabc4751c95d035b5e77151b3605b809884fec2c10edf37d4c4e4e231e8479"},
         {L"D2Gfx.dll", "50284647a28e8839028e8acb021a6ebe48c006e431139969ccd0fe126e6e8811"},
         {L"D2Lang.dll", "206386a81f4046c693f2aca60b9ee19fffd05b1157bbb60992c0d4caad9b67ec"},
-        {L"ProjectDiablo.dll", "538a77b7ccef3d5334e56c4e9e57a4d8fc69a1e27c46beb694c0dedfcfbf9cb3"}
+        {L"ProjectDiablo.dll", "e7eec2564811c7b347bc62b9d738569329c4971055b8f79ce42a9a5a250e903b"}
     };
 
     bool ModulePath(HMODULE module, std::wstring& path) {
@@ -196,6 +196,9 @@ namespace LabProfile {
         return VerifyCachedImage(L"D2Game.dll",
             "24b293b86f95bea0228826c502ea04737ba21b91ca9832e52aac4b11fef14f53",
             verifiedServer, error);
+    }
+    bool VerifyMod(std::string& error) {
+        return VerifyCachedImage(L"ProjectDiablo.dll", kImages[8].digest, verifiedMod, error);
     }
     bool BackendFileIdentity(std::string& digest) {
         SharedImageLock lock;

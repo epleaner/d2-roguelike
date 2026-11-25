@@ -32,8 +32,8 @@ namespace {
     Patch* runConsumableName = nullptr;
     bool startupApproved = false;
 
-    // Measured from the SHA-256-pinned S13 patch2 D2Client.dll and D2Win.dll
-    // disk images (1.13c first-column offsets), not from the S12 PD2 addon.
+    // Pin the S14 Patch #2 client/GUI images; D2Client is unchanged from S13,
+    // while the D2Win hook bytes were verified in the changed S14 image.
     constexpr BYTE kGameLoopSite[] = { 0x83, 0xEC, 0x20, 0x89, 0x4C, 0x24, 0x0C };
     constexpr BYTE kOogDrawSite[] = { 0x8B, 0x76, 0x3C, 0x85, 0xF6 };
     // Client inventory-name callsite: mov al,[ebp+12a], after stock name

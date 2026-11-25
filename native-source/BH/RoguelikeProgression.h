@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@ struct VanillaArea {
     std::array<std::uint32_t, 3> densities{};
     const std::uint16_t* normalRoster = nullptr;
     const std::uint16_t* nightmareRoster = nullptr;
+    unsigned act = 0; // Zero-based campaign Act, not the destination's engine Act.
 };
 
 struct EncounterSelection {
@@ -21,7 +23,71 @@ struct EncounterSelection {
     unsigned eligibleClasses = 0;
     unsigned areaLevel = 0;
     unsigned density = 0;
+    std::array<std::uint8_t, 4> sourceActs{};
 };
+constexpr unsigned allCampaignActs = 0x1F;
+constexpr unsigned ActBit(unsigned act) noexcept {
+    return act < 5 ? 1u << act : 0u;
+}
+
+struct ArenaSlot {
+    int level = 0;
+    unsigned act = 0;
+    int layout = -1;
+};
+
+// Callers shuffle the slots once. Reserving a slot cannot consume any of the
+// other slots with the same layout or accidentally offer one destination twice.
+class FreshArenas {
+public:
+    void Add(ArenaSlot arena) {
+        if (arena.layout < 0) arena.layout = static_cast<int>(count_);
+        slots_[count_++] = arena;
+    }
+    template <class Random>
+    void Shuffle(Random& random) {
+        std::shuffle(slots_.begin(), slots_.begin() + count_, random);
+    }
+    unsigned AvailableActs() const {
+        unsigned acts = 0;
+        for (std::size_t i = 0; i < count_; ++i)
+            if (slots_[i].level) acts |= ActBit(slots_[i].act);
+        return acts;
+    }
+    // The first slot for a chosen layout in the shuffled list is itself uniform.
+    template <class Random>
+    int TakeLayout(unsigned act, Random& random) {
+        std::array<bool, 121> seen{};
+        ArenaSlot* selected = nullptr;
+        unsigned layouts = 0;
+        for (std::size_t i = 0; i < count_; ++i) {
+            auto& slot = slots_[i];
+            if (!slot.level || slot.act != act || seen[slot.layout]) continue;
+            seen[slot.layout] = true;
+            if (std::uniform_int_distribution<unsigned>(1, ++layouts)(random) == 1)
+                selected = &slot;
+        }
+        if (!selected) return 0;
+        const int level = selected->level;
+        selected->level = 0;
+        return level;
+    }
+    int Take(unsigned act) {
+        for (std::size_t i = 0; i < count_; ++i) {
+            auto& slot = slots_[i];
+            if (slot.level && slot.act == act) {
+                const int level = slot.level;
+                slot.level = 0;
+                return level;
+            }
+        }
+        return 0;
+    }
+private:
+    std::array<ArenaSlot, 121> slots_{};
+    std::size_t count_ = 0;
+};
+
 inline constexpr unsigned maximumMonsterTypes = 4;
 constexpr unsigned MaximumMonsterTypesForDepth(unsigned depth) noexcept {
     return depth <= 20 ? 2 : (depth <= 40 ? 3 : maximumMonsterTypes);
@@ -52,7 +118,7 @@ constexpr unsigned maximumDensity = 100000;
 using SeenClasses = std::array<std::uint64_t, classCapacity / 64>;
 
 template <class Random>
-void SampleUniqueClass(std::uint16_t classId, SeenClasses& seen,
+void SampleUniqueClass(std::uint16_t classId, unsigned sourceAct, SeenClasses& seen,
     Random& random, EncounterSelection& selection) {
     const std::uint64_t mask = std::uint64_t{1} << (classId % 64);
     std::uint64_t& word = seen[classId / 64];
@@ -60,17 +126,20 @@ void SampleUniqueClass(std::uint16_t classId, SeenClasses& seen,
     word |= mask;
     ++selection.eligibleClasses;
     if (selection.count < selection.classes.size()) {
+        selection.sourceActs[selection.count] = static_cast<std::uint8_t>(sourceAct);
         selection.classes[selection.count++] = classId;
         return;
     }
     const unsigned replacement = std::uniform_int_distribution<unsigned>(
         1, selection.eligibleClasses)(random);
-    if (replacement <= selection.classes.size())
+    if (replacement <= selection.classes.size()) {
         selection.classes[replacement - 1] = classId;
+        selection.sourceActs[replacement - 1] = static_cast<std::uint8_t>(sourceAct);
+    }
 }
 
 template <class Spawnable, class Random>
-bool CollectRoster(const std::uint16_t* roster, unsigned validClasses,
+bool CollectRoster(const std::uint16_t* roster, unsigned sourceAct, unsigned validClasses,
     Spawnable& spawnable, const std::array<std::uint16_t, 2>& excludedClasses,
     unsigned excludedCount, SeenClasses& seen, Random& random,
     EncounterSelection& selection) {
@@ -84,8 +153,8 @@ bool CollectRoster(const std::uint16_t* roster, unsigned validClasses,
         bool excluded = false;
         for (unsigned index = 0; index < excludedCount; ++index)
             excluded = excluded || classId == excludedClasses[index];
-        if (!excluded)
-            SampleUniqueClass(classId, seen, random, selection);
+        if (!excluded && ActBit(sourceAct))
+            SampleUniqueClass(classId, sourceAct, seen, random, selection);
     }
     return hasSpawnable;
 }
@@ -106,7 +175,7 @@ bool SelectVanillaEncounters(const VanillaArea* areas, std::size_t areaCount,
     unsigned depth, unsigned classLimit, Spawnable spawnable, Random& random,
     EncounterSelection& selection,
     std::array<std::uint16_t, 2> excludedClasses = {},
-    unsigned excludedCount = 0) {
+    unsigned excludedCount = 0, unsigned availableActs = allCampaignActs) {
     selection = {};
     if (!areas || !depth || !classLimit || excludedCount > excludedClasses.size())
         return false;
@@ -128,7 +197,8 @@ bool SelectVanillaEncounters(const VanillaArea* areas, std::size_t areaCount,
                 continue;
             const std::uint16_t* roster = difficulty == 0 ?
                 area.normalRoster : area.nightmareRoster;
-            if (CollectRoster(roster, validClasses, spawnable, excludedClasses,
+            const unsigned act = (availableActs & ActBit(area.act)) ? area.act : 5u;
+            if (CollectRoster(roster, act, validClasses, spawnable, excludedClasses,
                     excludedCount, seen, random, selection))
                 RecordAreaDensity(areaLevel, density, selection);
         }
@@ -144,6 +214,9 @@ bool SelectVanillaEncounters(const VanillaArea* areas, std::size_t areaCount,
             const std::uint16_t current = selection.classes[index];
             selection.classes[index] = selection.classes[selected];
             selection.classes[selected] = current;
+            const auto act = selection.sourceActs[index];
+            selection.sourceActs[index] = selection.sourceActs[selected];
+            selection.sourceActs[selected] = act;
         }
         selection.count = rosterCount;
         return true;

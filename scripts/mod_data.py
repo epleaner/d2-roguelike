@@ -34,12 +34,18 @@ _ROW_TEMPLATE_KEYS = {
     "data/global/excel/misc.txt": "code",
 }
 _PATCHSTRING = "data/local/LNG/ENG/patchstring.tbl"
+ROGUELIKE_ABYSS_KEY = "d2lab_roguelike_abyss"
+ROGUELIKE_ABYSS_START_KEY = "d2lab_roguelike_abyss_start"
 _LEGACY_TREASURECLASS = "data/global/excel/treasureclass.txt"
 _LEGACY_TREASURE_KEY = "LegacyTreasureClass"
 _PATCHSTRING_MEMBER = r"data\local\LNG\ENG\patchstring.tbl"
 _NAME = re.compile(r"[a-z][a-z0-9-]{1,31}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
+_LVLTYPES_FILE_COLUMN = re.compile(r"File (?:[1-9]|[12][0-9]|3[0-2])\Z")
+_DS1_MAP_SEGMENT = r"[A-Za-z0-9_-](?:[A-Za-z0-9_. -]*[A-Za-z0-9_-])?"
+_DT1_PATH = re.compile(rf"(?:{_DS1_MAP_SEGMENT}/)*{_DS1_MAP_SEGMENT}\.dt1\Z",
+                       re.IGNORECASE)
 _MONSTER_ASSET_MODES = ("NU", "WL", "GH", "A1", "A2", "DT", "DD")
 _MONSTER_ASSET_ROOT = "data/global/monsters/{token}"
 _MONSTER_ANIMDATA = "data/global/AnimData.d2"
@@ -48,11 +54,12 @@ _VISUAL_ASSET_PATHS = frozenset({
     "data/global/items/invxtphf.dc6",
     "data/global/items/invjewel.dc6",
     "data/global/ui/spells/BaSkillicon.DC6",
-    "data/global/tiles/Act1/Outdoors/RogueTower13.ds1",
-    "data/global/tiles/Act1/Outdoors/RogueTower14.ds1",
-    "data/global/tiles/Act1/Outdoors/RogueTower15.ds1",
-    "data/global/tiles/Act1/Outdoors/RogueTower16.ds1",
 })
+# Covers the compact shortlist, distinct frontier rooms, and retained assets.
+_MAX_VISUAL_ASSET_FILES = 48
+ASSET_PACKAGE_TARGET = "Project Diablo II S14 patch #2, LoD engine; not D2R"
+_DS1_MAP_PATH = re.compile(
+    rf"data/global/tiles/(?:{_DS1_MAP_SEGMENT}/)*{_DS1_MAP_SEGMENT}\.ds1\Z")
 
 
 _IDENTITY = {"id", "hcidx", "code"}
@@ -154,7 +161,8 @@ def _validated_monster_asset_records(records, token):
 def _validated_visual_asset_record(record):
     if (not isinstance(record, dict) or set(record) != {"path", "sha256", "bytes"} or
             not isinstance(record["path"], str) or
-            record["path"] not in _VISUAL_ASSET_PATHS or
+            not (record["path"] in _VISUAL_ASSET_PATHS or
+                 _DS1_MAP_PATH.fullmatch(record["path"])) or
             not isinstance(record["sha256"], str) or not _HASH.fullmatch(record["sha256"]) or
             type(record["bytes"]) is not int or record["bytes"] <= 0):
         raise ValueError("Invalid visual asset file record")
@@ -162,11 +170,13 @@ def _validated_visual_asset_record(record):
 
 
 def _validated_visual_asset_records(records):
-    if not isinstance(records, list) or not 1 <= len(records) <= len(_VISUAL_ASSET_PATHS):
-        raise ValueError("Visual asset manifest must contain one or more allowlisted files")
+    if not isinstance(records, list) or not 1 <= len(records) <= _MAX_VISUAL_ASSET_FILES:
+        raise ValueError(
+            "Visual asset manifest must contain one or more supported files "
+            f"(maximum {_MAX_VISUAL_ASSET_FILES})")
     checked = [_validated_visual_asset_record(record) for record in records]
-    if len({record["path"] for record in checked}) != len(checked):
-        raise ValueError("Duplicate visual asset path")
+    if len({record["path"].casefold() for record in checked}) != len(checked):
+        raise ValueError("Duplicate or case-colliding visual asset path")
     return sorted(checked, key=lambda record: record["path"])
 
 
@@ -195,7 +205,7 @@ def _read_visual_asset_package(package_dir):
         raise ValueError("Invalid or symlinked visual asset package")
     manifest = _load_json(manifest_path)
     if (not isinstance(manifest, dict) or
-            manifest.get("target") != "Project Diablo II S13 patch #2, LoD engine; not D2R"):
+            manifest.get("target") != ASSET_PACKAGE_TARGET):
         raise ValueError("Visual asset package target mismatch")
     records = _validated_visual_asset_records(manifest.get("files"))
     return records, _read_asset_payloads(package_dir, records, "visual")
@@ -211,7 +221,7 @@ def _read_monster_asset_package(package_dir, token):
         raise ValueError("Invalid or symlinked monster asset package")
     manifest = _load_json(manifest_path)
     if (not isinstance(manifest, dict) or
-            manifest.get("target") != "Project Diablo II S13 patch #2, LoD engine; not D2R" or
+            manifest.get("target") != ASSET_PACKAGE_TARGET or
             manifest.get("token") != token or manifest.get("component") != "TR" or
             manifest.get("modes") != list(_MONSTER_ASSET_MODES) or
             manifest.get("directions") != 8):
@@ -313,15 +323,29 @@ def _row(data, key_column, key, column):
     return lines, index, ci, cells[ci]
 
 
+def _allows_numeric_to_text_replacement(change, current):
+    return (
+        (
+            change["table"] == "data/global/excel/charstats.txt" and
+            change["column"] == "item6" and current == b"0" and
+            change["value"] == "rid"
+        ) or
+        (
+            change["table"] == "data/global/excel/lvltypes.txt" and
+            current == b"0" and
+            _LVLTYPES_FILE_COLUMN.fullmatch(change["column"]) is not None and
+            _DT1_PATH.fullmatch(change["value"]) is not None
+        )
+    )
+
+
 def _replace(data, change, expected):
     lines, index, ci, current = _row(data, change["key_column"], change["key"], change["column"])
     if current != _cell(expected):
         raise ValueError("Expected cell differs from current value")
     if (_NUMBER.fullmatch(current.decode("cp1252")) and
             not _NUMBER.fullmatch(change["value"]) and
-            not (change["table"] == "data/global/excel/charstats.txt" and
-                 change["column"] == "item6" and current == b"0" and
-                 change["value"] == "rid")):
+            not _allows_numeric_to_text_replacement(change, current)):
         raise ValueError("Numeric cell requires numeric replacement")
     line = lines[index]
     ending = b"\r\n" if line.endswith(b"\r\n") else b"\n" if line.endswith(b"\n") else b"\r" if line.endswith(b"\r") else b""
@@ -329,6 +353,65 @@ def _replace(data, change, expected):
     cells[ci] = _cell(change["value"])
     lines[index] = b"\t".join(cells) + ending
     return b"".join(lines)
+
+def _replace_many(data, changes):
+    """Apply validated table changes with one row index per key column."""
+    if not changes:
+        return data
+    if changes[0]["key_column"] == _LEGACY_TREASURE_KEY:
+        for change in changes:
+            data = _replace(data, change, change["expected"])
+        return data
+
+    lines = _records(data)
+    if not lines:
+        raise ValueError("Empty table")
+    header = lines[0].rstrip(b"\r\n").decode("cp1252").split("\t")
+    rows = []
+    endings = []
+    for line in lines[1:]:
+        ending = (b"\r\n" if line.endswith(b"\r\n") else
+                  b"\n" if line.endswith(b"\n") else
+                  b"\r" if line.endswith(b"\r") else b"")
+        rows.append((line[:-len(ending)] if ending else line).split(b"\t"))
+        endings.append(ending)
+
+    rows_by_key = {}
+    changed_rows = set()
+    for change in changes:
+        key_column, column = change["key_column"], change["column"]
+        if header.count(key_column) != 1 or header.count(column) != 1:
+            raise ValueError("Missing or duplicate key/target column")
+        if key_column not in rows_by_key:
+            key_index = header.index(key_column)
+            index = {}
+            for row_index, cells in enumerate(rows):
+                if len(cells) > key_index:
+                    index.setdefault(cells[key_index], []).append(row_index)
+            rows_by_key[key_column] = index
+        matches = rows_by_key[key_column].get(_cell(change["key"]), [])
+        if len(matches) != 1:
+            raise ValueError("Missing or duplicate row key")
+        row_index = matches[0]
+        cells = rows[row_index]
+        if len(cells) != len(header):
+            raise ValueError("Target row does not match header layout")
+        column_index = header.index(column)
+        current = cells[column_index]
+        if current != _cell(change["expected"]):
+            raise ValueError("Expected cell differs from current value")
+        if (_NUMBER.fullmatch(current.decode("cp1252")) and
+                not _NUMBER.fullmatch(change["value"]) and
+                not _allows_numeric_to_text_replacement(change, current)):
+            raise ValueError("Numeric cell requires numeric replacement")
+        cells[column_index] = _cell(change["value"])
+        changed_rows.add(row_index)
+
+    for row_index in sorted(changed_rows):
+        lines[row_index + 1] = b"\t".join(rows[row_index]) + endings[row_index]
+    return b"".join(lines)
+
+
 
 def _template_rows(data, operation):
     """Copy one authenticated source row into bounded, distinctly keyed rows."""
@@ -805,11 +888,14 @@ class Store:
         if not all(isinstance(entries, list) for entries in (unique_items, skills, monsters)):
             raise ValueError("Invalid revision localized operations")
         misc_items = any(op["table"] == "data/global/excel/misc.txt" for op in row_templates)
-        if not unique_items and not skills and not monsters and not misc_items:
+        abyss = Store._has_abyss_name(row_templates)
+        if not unique_items and not skills and not monsters and not misc_items and not abyss:
             if source_id is not None:
                 raise ValueError("Unneeded localized string-table resource")
             return None
         if source_id is None:
+            if abyss:
+                raise ValueError("Roguelike arena names require authenticated English localization")
             if monsters or misc_items:
                 raise ValueError("Misc and monster revisions require authenticated English localization")
             Store._validate_legacy_localized_operations(unique_items, skills)
@@ -1702,6 +1788,14 @@ class Store:
                             (keys["alt"], skill["description"])))
         return entries
 
+    @staticmethod
+    def _has_abyss_name(row_templates):
+        return any(
+            entry["cells"].get("LevelName") == ROGUELIKE_ABYSS_KEY
+            for op in row_templates if op["table"] == "data/global/excel/levels.txt"
+            for mode in ("updates", "additions") for entry in op[mode]
+        )
+
     def _render_localization(self, baseline, tables, unique_items, skills, monsters, row_templates):
         source = self._source_localization_bytes(baseline)
         entries = [(_unique_string_key(index), item["name"])
@@ -1712,6 +1806,9 @@ class Store:
             entries.extend(self._skill_localization_entries(tables, skills))
         entries.extend((f"d2lab_monster_{monster['token'].lower()}_name", monster["name"])
                        for monster in monsters)
+        if self._has_abyss_name(row_templates):
+            entries.extend(((ROGUELIKE_ABYSS_KEY, "The Abyss"),
+                            (ROGUELIKE_ABYSS_START_KEY, "The Abyss - Level 1")))
         entries.extend(
             (entry["cells"]["namestr"], entry["cells"]["*name"])
             for operation in row_templates
@@ -1771,15 +1868,17 @@ class Store:
     def _render(self, baseline, changes, recipes=None, unique_items=None, skills=None,
                 monsters=None, *, legacy=False, visual_assets=None, row_templates=None):
         result = self._baseline_bytes(baseline)
+        changes_by_table = {}
         for change in changes:
-            table = change["table"]
-            result[table] = _replace(result[table], change, change["expected"])
+            changes_by_table.setdefault(change["table"], []).append(change)
+        for table, table_changes in changes_by_table.items():
+            result[table] = _replace_many(result[table], table_changes)
         for operation in _validated_row_templates(row_templates or [], baseline):
             path = operation["table"]
             result[path] = _template_rows(result[path], operation)
         self._render_authored_tables(
             result, baseline, recipes, unique_items, skills, monsters, legacy)
-        if (unique_items or skills or monsters or any(
+        if (unique_items or skills or monsters or self._has_abyss_name(row_templates or []) or any(
                 op["table"] == "data/global/excel/misc.txt" for op in row_templates or [])) and not legacy:
             result[_PATCHSTRING] = self._render_localization(
                 baseline, result, unique_items or [], skills or [], monsters or [],
@@ -2278,16 +2377,53 @@ class Store:
         if state["workspace_revision"] != expected_revision:
             raise ValueError("Stale workspace revision")
         records, payloads = _read_visual_asset_package(package_dir)
-        existing = ({record["path"] for record in state.get("visual_assets", [])} |
-                    {record["path"] for monster in state.get("monsters", [])
+        existing = ({record["path"].casefold() for record in state.get("visual_assets", [])} |
+                    {record["path"].casefold() for monster in state.get("monsters", [])
                      for record in monster.get("asset_files", [])})
-        if existing.intersection(record["path"] for record in records):
+        if existing.intersection(record["path"].casefold() for record in records):
             raise ValueError("Visual asset path is already attached")
+        visual_assets = _validated_visual_asset_records(
+            [*state.get("visual_assets", []), *records])
         for record in records:
             blob = _safe_store_path(self, self.root / "asset-blobs" / record["sha256"])
             _atomic_bytes(blob, payloads[record["path"]])
-        visual_assets = sorted([*state.get("visual_assets", []), *records],
-                               key=lambda record: record["path"])
+        new_state = {**state, "visual_assets": visual_assets,
+                     "workspace_revision": self._workspace_id(
+                         baseline, state["changes"], state.get("recipes", []),
+                         state.get("unique_items", []), state.get("skills", []),
+                         state.get("monsters", []), visual_assets=visual_assets,
+                         row_templates=state.get("row_templates", []),
+                         legacy=state["legacy"])}
+        self._render(baseline, state["changes"], state.get("recipes", []),
+                     state.get("unique_items", []), state.get("skills", []),
+                     state.get("monsters", []), legacy=self._legacy_rendering(state),
+                     visual_assets=visual_assets, row_templates=state.get("row_templates", []))
+        _atomic_json(self.root / "workspaces" / name / "state.json", new_state)
+        return self.inspect(name=name)
+
+    @_locked
+    def replace_visual_assets(self, name, package_dir, expected_revision) -> dict:
+        """Replace only already-attached visual asset paths in a workspace."""
+        baseline = self._manifest()
+        state = self._workspace(name, baseline)
+        if state["workspace_revision"] != expected_revision:
+            raise ValueError("Stale workspace revision")
+        records, payloads = _read_visual_asset_package(package_dir)
+        existing = {record["path"].casefold(): record["path"]
+                    for record in state.get("visual_assets", [])}
+        replacements = {}
+        for record in records:
+            path = existing.get(record["path"].casefold())
+            if path is None:
+                raise ValueError("Visual asset path is not already attached")
+            replacements[path] = {**record, "path": path}
+        visual_assets = sorted(
+            [replacements.get(record["path"], record)
+             for record in state.get("visual_assets", [])],
+            key=lambda record: record["path"])
+        for record in records:
+            blob = _safe_store_path(self, self.root / "asset-blobs" / record["sha256"])
+            _atomic_bytes(blob, payloads[record["path"]])
         new_state = {**state, "visual_assets": visual_assets,
                      "workspace_revision": self._workspace_id(
                          baseline, state["changes"], state.get("recipes", []),
@@ -2440,7 +2576,7 @@ class Store:
                     "files": files, "changes": state["changes"]}
         source_id = None
         source = baseline.get("localization_source")
-        if (unique_items or skills or monsters or any(
+        if (unique_items or skills or monsters or self._has_abyss_name(state.get("row_templates", [])) or any(
                 op["table"] == "data/global/excel/misc.txt"
                 for op in state.get("row_templates", []))) and not self._legacy_rendering(state):
             if source is None:

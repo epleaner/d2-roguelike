@@ -557,7 +557,7 @@ struct LevelsTxt
 	DWORD dwSoundEnv;
 };
 
-struct ItemStatCostTxt  // ProjectDiablo S13 loaded record size 0x150
+struct ItemStatCostTxt  // ProjectDiablo S14 loaded record size 0x15C
 {
 	WORD	wStat;				//0x00
 	WORD 	_1;					//0x02
@@ -623,7 +623,7 @@ struct ItemStatCostTxt  // ProjectDiablo S13 loaded record size 0x150
 	WORD	wOpStat2;			//0x5A
 	WORD	wOpStat3;			//0x5C
 	BYTE 	_Stuff[230];		//0x5E
-	BYTE	_ModExtension[12];	//0x144, opaque; do not interpret as vanilla metadata
+	BYTE	_ModExtension[24];	//0x144, opaque S13/S14 save columns
 };
 
 struct MissilesTxt
@@ -1892,11 +1892,11 @@ struct sgptDataTable {
 	DWORD* pIgnoreList;            //0xD0C
 };
 
-// ProjectDiablo S13 RVA 0x251863 compiles ItemStatCost rows at 0x150
+// ProjectDiablo S14 RVA 0x2E6659 compiles ItemStatCost rows at 0x15C
 // bytes and stores them at Common's table +0xBCC, count +0xBD4.
-// The mod's RVA 0x2CE6D0 getter likewise multiplies the indexed ID by
-// 0x150. Earlier native fields retain their original offsets.
-static_assert(sizeof(void*) == 4 && sizeof(ItemStatCostTxt) == 0x150 &&
+// The indexed getter at RVA 0x37C2B0 uses the same 0x15C stride.
+// Native fields accessed below precede the opaque extension at 0x144.
+static_assert(sizeof(void*) == 4 && sizeof(ItemStatCostTxt) == 0x15C &&
 	offsetof(ItemStatCostTxt, wStat) == 0 &&
 	offsetof(ItemStatCostTxt, bValShift) == 0x18 &&
 	offsetof(ItemStatCostTxt, bSaveBits) == 0x19 &&
@@ -1905,10 +1905,10 @@ static_assert(sizeof(void*) == 4 && sizeof(ItemStatCostTxt) == 0x150 &&
 	offsetof(ItemStatCostTxt, bEncode) == 0x30 &&
 	offsetof(sgptDataTable, pItemStatCostTxt) == 0xBCC &&
 	offsetof(sgptDataTable, dwItemStatCostRecs) == 0xBD4,
-	"S13 ItemStatCost ABI");
+	"S14 ItemStatCost ABI");
 // The control-path file identity check is cached after the first successful
 // modded-table access; neither observation nor catalog runs it on trace hooks.
-inline bool S13ItemStatCostModFileVerified() {
+inline bool S14ItemStatCostModFileVerified() {
 	static const bool verified = [] {
 		std::string digest;
 		return LabProfile::ModFileIdentity(digest);
@@ -1918,34 +1918,29 @@ inline bool S13ItemStatCostModFileVerified() {
 
 // Check the loaded mod's table compiler and getter, not vanilla D2Common's
 // obsolete 0x144 lookup. The getter's first absolute address is relocated.
-inline bool S13ItemStatCostLookupMatches() {
+inline bool S14ItemStatCostLookupMatches() {
 	const BYTE* mod = reinterpret_cast<const BYTE*>(GetModuleHandleA("ProjectDiablo.dll"));
-	if (!S13ItemStatCostModFileVerified()) return false;
+	if (!S14ItemStatCostModFileVerified()) return false;
 	if (!mod) return false;
-	const BYTE* common = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2Common.dll"));
-	if (!common) return false;
 	DWORD getterOperand = 0;
-	std::memcpy(&getterOperand, mod + 0x2CE6D1, sizeof(getterOperand));
-	DWORD tableGlobal = 0;
-	std::memcpy(&tableGlobal, mod + 0x4E34B8, sizeof(tableGlobal));
-	if (getterOperand != reinterpret_cast<uintptr_t>(mod + 0x4E34B8) ||
-		tableGlobal != reinterpret_cast<uintptr_t>(common + 0x99E1C)) return false;
-	static const BYTE loader[] = {0x68, 0x50, 0x01, 0, 0, 0x89, 0x06,
+	std::memcpy(&getterOperand, mod + 0x37C2B1, sizeof(getterOperand));
+	if (getterOperand != reinterpret_cast<uintptr_t>(mod + 0x5DEEBC)) return false;
+	static const BYTE loader[] = {0x68, 0x5C, 0x01, 0, 0, 0x89, 0x06,
 		0x8D, 0xB3, 0xD4, 0x0B, 0, 0};
 	static const BYTE store[] = {0x89, 0x97, 0xCC, 0x0B, 0, 0};
-	static const BYTE advance[] = {0x81, 0xC6, 0x50, 0x01, 0, 0};
+	static const BYTE advance[] = {0x81, 0xC6, 0x5C, 0x01, 0, 0};
 	static const BYTE getter[] = {0x8B, 0x10, 0x85, 0xC9, 0x78, 0x1B,
 		0x8B, 0x82, 0xD4, 0x0B, 0, 0, 0x3B, 0xC1, 0x76, 0x11,
-		0x85, 0xC0, 0x74, 0x0D, 0x69, 0xC1, 0x50, 0x01, 0, 0,
+		0x85, 0xC0, 0x74, 0x0D, 0x69, 0xC1, 0x5C, 0x01, 0, 0,
 		0x03, 0x82, 0xCC, 0x0B, 0, 0, 0xC3, 0x33, 0xC0, 0xC3};
-	return std::memcmp(mod + 0x251863, loader, sizeof(loader)) == 0 &&
-		std::memcmp(mod + 0x251895, store, sizeof(store)) == 0 &&
-		std::memcmp(mod + 0x251918, advance, sizeof(advance)) == 0 &&
-		std::memcmp(mod + 0x2CE6D5, getter, sizeof(getter)) == 0;
+	return std::memcmp(mod + 0x2E6659, loader, sizeof(loader)) == 0 &&
+		std::memcmp(mod + 0x2E668B, store, sizeof(store)) == 0 &&
+		std::memcmp(mod + 0x2E6713, advance, sizeof(advance)) == 0 &&
+		std::memcmp(mod + 0x37C2B5, getter, sizeof(getter)) == 0;
 }
 
-inline bool S13ItemStatCostLayoutValid(const sgptDataTable* tables) {
-	if (!S13ItemStatCostLookupMatches()) return false;
+inline bool S14ItemStatCostLayoutValid(const sgptDataTable* tables) {
+	if (!S14ItemStatCostLookupMatches()) return false;
 	if (!tables) return false;
 	MEMORY_BASIC_INFORMATION header = {};
 	if (!VirtualQuery(tables, &header, sizeof(header)) || header.State != MEM_COMMIT ||
@@ -1973,8 +1968,6 @@ inline bool S13ItemStatCostLayoutValid(const sgptDataTable* tables) {
 		if (end <= address || end < reinterpret_cast<uintptr_t>(region.BaseAddress)) return false;
 		address = end < finish ? end : finish;
 	}
-	for (DWORD id = 0; id < tables->dwItemStatCostRecs; ++id)
-		if (tables->pItemStatCostTxt[id].wStat != id) return false;
 	return true;
 }
 

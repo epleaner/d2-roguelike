@@ -14,7 +14,7 @@
 namespace {
 using json = nlohmann::json;
 
-// D2GAME.dll S13 SHA-256 24b293b86f95bea0228826c502ea04737ba21b91ca9832e52aac4b11fef14f53.
+// D2GAME.dll S14 Patch #2 SHA-256 24b293b86f95bea0228826c502ea04737ba21b91ca9832e52aac4b11fef14f53 (unchanged from S13).
 // 0x1E960 indexes game+0xD8+4*act, allocates 0x18-byte coordinate lists;
 // 0x1F6A5 allocates 0x5C-byte monster records, 0x1F9D6 links them at list+0x0C.
 #pragma pack(push, 1)
@@ -39,13 +39,13 @@ struct InactiveRoom {
     InactiveRoom* next;
 };
 #pragma pack(pop)
-static_assert(sizeof(void*) == 4, "S13 inactive records require x86");
+static_assert(sizeof(void*) == 4, "S14 inactive records require x86");
 static_assert(sizeof(InactiveMonster) == 0x5C && offsetof(InactiveMonster, typeFlags) == 0x18 &&
     offsetof(InactiveMonster, maxHp) == 0x44 && offsetof(InactiveMonster, hp) == 0x48 &&
     offsetof(InactiveMonster, frame) == 0x54 && offsetof(InactiveMonster, next) == 0x58,
-    "S13 compressed monster layout");
+    "S14 compressed monster layout");
 static_assert(sizeof(InactiveRoom) == 0x18 && offsetof(InactiveRoom, monsters) == 0x0C,
-    "S13 inactive room layout");
+    "S14 inactive room layout");
 
 bool Readable(const void* pointer, size_t bytes) {
     if (!pointer || !bytes) return false;
@@ -72,7 +72,7 @@ template <size_t N> bool CodeShape(HMODULE module, DWORD rva, const BYTE (&bytes
 bool Bind(std::string& error) {
     if (!LabProfile::VerifyServer(error)) return false;
     HMODULE module = GetModuleHandleA("D2GAME.dll");
-    if (!module) { error = "pinned S13 server image unavailable"; return false; }
+    if (!module) { error = "pinned S14 server image unavailable"; return false; }
     static const BYTE lists[] = {0x8B,0x4C,0x24,0x08,0x55,0x8B,0x6C,0x24,0x08,0x56,
         0x8B,0xB4,0x8D,0xD8,0,0,0,0x57,0x33,0xC0,0x33,0xFF,0x85,0xF6};
     BYTE allocation[] = {0x8B,0x4B,0x1C,0x6A,0,0x68,0x29,0x05,0,0,
@@ -97,7 +97,7 @@ bool Bind(std::string& error) {
         !CodeShape(module, 0x1F83E, alignment) || !CodeShape(module, 0x1F923, life) ||
         !CodeShape(module, 0x1F990, hp) || !CodeShape(module, 0x1F9C3, link) ||
         !CodeShape(module, 0x1FEF4, restoreHp)) {
-        error = "unexpected S13 inactive monster writer or list layout";
+        error = "unexpected S14 inactive monster writer or list layout";
         return false;
     }
     return true;
@@ -253,7 +253,7 @@ bool PrepareRoomClear(std::string& error) {
     if (!bound) error = "unsupported S13 inactive population bindings";
     return bound;
 }
-ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* player, unsigned expectedLevel) {
+ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* player, unsigned expectedLevel, unsigned* remaining) {
     using State = ServerMonsters::RoomClearState;
     if (!game || !player || !player->pPath || !player->pPath->pRoom1 ||
         !player->pPath->pRoom1->pRoom2 || !player->pPath->pRoom1->pRoom2->pLevel ||
@@ -266,6 +266,7 @@ ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* playe
     if (!global || !*global || !(*global)->pMonStatsTxt) return State::Unavailable;
     const sgptDataTable* const table = *global;
     size_t lists = 0, monsters = 0;
+    bool countedRooms[kRoomLimit]{};
     for (const InactiveRoom* list = heads[player->dwAct]; list; list = list->next) {
         if (++lists > kListLimit) return State::Unavailable;
         Room2* match = nullptr;
@@ -281,12 +282,16 @@ ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* playe
         if (!match) continue;
         // A restoring inactive list is not yet disjoint from the active room.
         if (match->pRoom1) return State::Unavailable;
+        if (remaining && countedRooms[rooms - 1]) return State::Unavailable;
+        if (remaining) countedRooms[rooms - 1] = true;
         for (const InactiveMonster* monster = list->monsters; monster; monster = monster->next) {
             if (++monsters > kMonsterLimit || monster->classId < 0 ||
                 static_cast<DWORD>(monster->classId) >= table->dwMonStatsRecs)
                 return State::Unavailable;
             const DWORD flags = monster->typeFlags;
             const DWORD alignment = flags & 0x380;
+            if (remaining && alignment && alignment != 0x80 &&
+                alignment != 0x100 && alignment != 0x200) return State::Unavailable;
             const MonStatsTxt& klass = table->pMonStatsTxt[monster->classId];
             if (!klass.dwFlags.bKillable || klass.dwFlags.bNPC || klass.dwFlags.binTown ||
                 alignment == 0x80 || alignment == 0x100 || (flags & 0x4))
@@ -294,9 +299,10 @@ ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* playe
             if ((monster->unitFlagsEx & 0x100) ||
                 monster->maxHp <= 0 || monster->hp <= 0 || monster->hp > monster->maxHp)
                 return State::Unavailable;
-            return State::LivingHostiles;
+            if (!remaining) return State::LivingHostiles;
+            ++*remaining;
         }
     }
-    return State::Clear;
+    return remaining && *remaining ? State::LivingHostiles : State::Clear;
 }
 } // namespace AreaPopulation

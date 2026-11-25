@@ -124,7 +124,7 @@ json Capture(void* game, UnitAny* serverPlayer, const ServerMonsters::Request& r
             {"session_epoch", activeEpoch}};
     // Validate before ObserveSnapshot's table hashing, not after computing a
     // digest over an incompatible or unreadable SDK record extent.
-    const bool statLayoutValid = S13ItemStatCostLayoutValid(
+    const bool statLayoutValid = S14ItemStatCostLayoutValid(
         ReadableTableGlobal() ? *p_D2COMMON_sgptDataTable : nullptr);
     if (!statLayoutValid) cachedRuntimeIdentity = json();
     bool includeIdentity = cachedRuntimeIdentity.is_null() && statLayoutValid;

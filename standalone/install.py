@@ -23,14 +23,15 @@ _IMAGES = {
     "D2Client.dll": "dd8bc6025de921216a97c17f97cd1a50fbb85926e838ec60e13451448836d906",
     "D2Common.dll": "59fa5928522f566f2bf99675571206ad70df889c89d3d07fa87edf5083e06e10",
     "D2Net.dll": "99af2f04a87fdbd91810be963df9c365cef529ae22e6a345193ba5018e9910c9",
-    "D2Win.dll": "ff5cbb956f1a419e0e76fc2df3be21065bbba894770b8de7cce8bc55ec453736",
+    "D2Win.dll": "ae367dbe0f0c2cccd7c317ce84601bba9745c06a199767aa55caeab2d45dc442",
     "D2Launch.dll": "99cabc4751c95d035b5e77151b3605b809884fec2c10edf37d4c4e4e231e8479",
     "D2Gfx.dll": "50284647a28e8839028e8acb021a6ebe48c006e431139969ccd0fe126e6e8811",
     "D2Lang.dll": "206386a81f4046c693f2aca60b9ee19fffd05b1157bbb60992c0d4caad9b67ec",
-    "ProjectDiablo.dll": "538a77b7ccef3d5334e56c4e9e57a4d8fc69a1e27c46beb694c0dedfcfbf9cb3",
+    "ProjectDiablo.dll": "e7eec2564811c7b347bc62b9d738569329c4971055b8f79ce42a9a5a250e903b",
     "D2Game.dll": "24b293b86f95bea0228826c502ea04737ba21b91ca9832e52aac4b11fef14f53",
+    "PD2_EXT.dll": "972753e89630a6371aba34464b789340b3d489f9d3544d758d9fb61cc7a70d14",
 }
-_OFFICIAL_BH = "cba04ff9e6f944942d69e4b610eeb0a8434bc780d312970ea922877fd134ac74"
+_OFFICIAL_BH = "4173b0c2146c0001ebecfb8b10be73915daf3b933f1fd6e05b71f11992692998"
 _METADATA = ".roguelike-launcher"
 _OWNER = "owner.json"
 _RECEIPT = "installed.json"
@@ -127,7 +128,7 @@ def _verify_images(project: Path) -> None:
         path = project / name
         _no_link_ancestors(path)
         if not path.is_file() or _hash(path) != expected:
-            raise ValueError(f"This is not the supported PD2 S13 patch #2 installation: {name}")
+            raise ValueError(f"This is not the supported PD2 S14 patch #2 installation: {name}")
 
 
 def _game_process_paths() -> list[str]:
@@ -413,8 +414,10 @@ def _prepared_configs(project: Path, copy: Path) -> tuple[dict, dict]:
 def _stage_release(folder: Path, transaction: Path, package: Package) -> tuple[dict, list[dict]]:
     project = folder / "ProjectD2"
     config, settings = _prepared_configs(project, folder)
-    result = mod_data_plan.render_plan(package.plan, project / "pd2data.mpq",
-                                       folder / "d2data.mpq", transaction / "rendered")
+    result = mod_data_plan.render_plan(
+        package.plan, project / "pd2data.mpq", folder / "d2data.mpq", transaction / "rendered",
+        expansion_archive=folder / "d2exp.mpq", patch_archive=folder / "patch_d2.mpq",
+        maps_archive=project / "pd2maps.mpq")
     if result["revision"] != package.revision:
         raise ValueError("Rendered revision differs from the downloaded release")
     (transaction / "new-BH.dll").write_bytes(package.dll)

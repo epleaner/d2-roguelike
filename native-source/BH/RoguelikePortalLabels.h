@@ -17,10 +17,10 @@ struct Request {
     const wchar_t* monsterSuffix = nullptr;
     int areaLevel = 0;
     int density = 0;
+    std::uint64_t mapTiles = 0;
     const RoguelikeAffixes::NativeStat* stats = nullptr;
     unsigned statCount = 0;
     const wchar_t* reward = nullptr;
-    int activeLevel = 0;
 };
 
 struct StatEffect {
@@ -30,13 +30,12 @@ struct StatEffect {
     Unit unit;
 };
 
-// These are the map-stat IDs emitted by the authenticated S13 affix pool.
-// Values are the resolved native stat integers; categorical properties have
-// no numeric display value and retain their native effect wording.
+// S14 Patch #2 ItemStatCost retains the mapped S13 stat IDs and names.
+// Numeric values are native stat IDs, not Properties.txt row IDs.
+// Categorical properties have no display value and keep native wording.
 inline constexpr StatEffect kStatEffects[] = {
     {370, L"Magic Find ", L"", Unit::Percent},
     {371, L"Gold Find ", L"", Unit::Percent},
-    {372, L"Monster Density ", L"", Unit::Percent},
     {373, L"Experience ", L"", Unit::Percent},
     {374, L"Area level ", L"", Unit::Number},
     {375, L"Monster Rarity ", L"", Unit::Percent},
@@ -225,6 +224,20 @@ inline bool AppendColoredLabel(wchar_t* output, std::size_t capacity,
         AppendColor(output, capacity, length, L'0');
 }
 
+inline const wchar_t* MapSize(std::uint64_t tiles) {
+    if (tiles <= 144) return L"Tiny";
+    if (tiles <= 400) return L"Small";
+    if (tiles <= 700) return L"Medium";
+    return L"Large";
+}
+
+inline const wchar_t* Density(int density) {
+    if (density < 600) return L"Sparse";
+    if (density < 1200) return L"Normal";
+    if (density < 2000) return L"Dense";
+    return L"Swarming";
+}
+
 inline bool Format(const Request& request, wchar_t* output,
     std::size_t capacity) {
     if (!output || !capacity) return false;
@@ -242,14 +255,9 @@ inline bool Format(const Request& request, wchar_t* output,
     case Kind::Chest:
         return AppendColoredLabel(output, capacity, length, L'8', L"Treasure") || fail();
     case Kind::TownEntry:
-        return AppendColoredLabel(output, capacity, length, L'1', L"Begin descent") || fail();
+        return AppendColoredLabel(output, capacity, length, L'1', L"Enter the Abyss") || fail();
     case Kind::Resume:
-        if (!AppendColor(output, capacity, length, L'1') ||
-            !AppendText(output, capacity, length, L"Resume descent (")) return fail();
-        if (!AppendInteger(output, capacity, length, request.activeLevel) ||
-            !AppendText(output, capacity, length, L")") ||
-            !AppendColor(output, capacity, length, L'0')) return fail();
-        return true;
+        return AppendColoredLabel(output, capacity, length, L'1', L"Return to the Abyss") || fail();
     case Kind::Monster:
     case Kind::Boss:
         break;
@@ -268,13 +276,18 @@ inline bool Format(const Request& request, wchar_t* output,
     if (!AppendText(output, capacity, length, L"Reward: ") ||
         !AppendText(output, capacity, length, request.reward)) return fail();
     if (request.kind == Kind::Monster) {
-        for (unsigned index = request.statCount; index > 0; --index)
-            if (!AppendEffect(output, capacity, length, request.stats[index - 1]))
+        for (unsigned index = request.statCount; index > 0; --index) {
+            const auto& stat = request.stats[index - 1];
+            if (stat.mapStat != 372 && !AppendEffect(output, capacity, length, stat))
                 return fail();
-        if (!AppendText(output, capacity, length, L"\nDensity ") ||
-            !AppendInteger(output, capacity, length, request.density)) return fail();
+        }
+        if (!AppendChar(output, capacity, length, L'\n')) return fail();
+        if (request.mapTiles &&
+            (!AppendText(output, capacity, length, MapSize(request.mapTiles)) ||
+             !AppendText(output, capacity, length, L", "))) return fail();
+        if (!AppendText(output, capacity, length, Density(request.density))) return fail();
     }
-    if (!AppendText(output, capacity, length, L"\nArea level ") ||
+    if (!AppendText(output, capacity, length, L"\nArea Lv. ") ||
         !AppendInteger(output, capacity, length, request.areaLevel) ||
         !AppendChar(output, capacity, length, L'\n') ||
         !AppendColor(output, capacity, length, monsterColor) ||

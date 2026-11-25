@@ -5,8 +5,8 @@
 #include <cstdint>
 #include <random>
 // A run level is progression depth, not a DRLG area ID or a map item's ilvl.
-// Map property IDs retain their S13 meanings; selected arenas feed the
-// pinned native map-world and map-monster consumers.
+// S14 Patch #2 ItemStatCost retains the mapped S13 stat IDs and names;
+// stat 375 changes ordinary Save Bits from 5 to 10 in the S14 data.
 namespace RoguelikeAffixes {
 enum class Quality { Normal, Magic, Rare };
 struct QualityWeights {
@@ -66,8 +66,8 @@ struct Roll {
     int magicFind = 0;
     int monsterHealthPercent = 0;
 };
-// S13 Warlord of Blood's native map-global corruption properties. These
-// enable PD2's own boss-drop corruption roll; they are not item modifiers.
+// S14 Patch #2 retains map-stat IDs 503 and 187; the S13-derived categories
+// 2006/2008 still require native S14 consumer verification.
 inline constexpr NativeStat kWarlordMapCorruption{503, 0, 2006, 100};
 inline constexpr NativeStat kWarlordBossCorruptedUnique{187, 0, 2008, 1};
 

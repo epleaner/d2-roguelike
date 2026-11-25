@@ -9,6 +9,11 @@ constexpr std::uint32_t kBasisPoints = 10000;
 constexpr std::uint32_t kDropFlagNeverEthereal = 0x02;
 constexpr std::uint32_t kDropFlagNoSockets = 0x08;
 constexpr std::uint32_t kDropFlagAlwaysSockets = 0x10;
+constexpr bool EarlyMagicRoll(int characterLevel, std::uint32_t roll,
+    unsigned whiteRange = kBasisPoints) noexcept {
+    return characterLevel >= 1 && characterLevel < 20 &&
+        roll < whiteRange * 3u * static_cast<unsigned>(20 - characterLevel) / 190u;
+}
 constexpr std::uint32_t DropGenerationFlags(bool forceSockets) noexcept {
     return kDropFlagNeverEthereal |
         (forceSockets ? kDropFlagAlwaysSockets : kDropFlagNoSockets);
@@ -270,8 +275,9 @@ constexpr bool TypeAllowsQuality(int quality, bool alwaysNormal,
     }
 }
 constexpr int RewardQualityAttempt(int requested, unsigned attempt,
-    bool whiteOnly) noexcept {
+    bool whiteOnly, bool starter = false) noexcept {
     if (requested != 2 && requested != 4 && requested != 6) return -1;
+    if (starter) return attempt == 0 && requested == 4 ? 4 : -1;
     if (whiteOnly)
         return attempt == 0 && requested == 2 ? 2 : -1;
     if (attempt == 0) return requested;

@@ -1289,11 +1289,12 @@ json ObserveSnapshot(void* game, UnitAny* serverPlayer, const Request& request,
 
 bool PrepareRoomClear(std::string& error) {
     static const bool bound = [] { std::string ignored; return Bind(ignored); }();
-    if (!bound) { error = "unsupported S13 monster bindings"; return false; }
+    if (!bound) { error = "unsupported S14 monster bindings"; return false; }
     return AreaPopulation::PrepareRoomClear(error);
 }
 // The current game thread owns these room and unit lists for this traversal.
-RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel) {
+RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel, unsigned* remaining) {
+    if (remaining) *remaining = 0;
     if (!game || !player || player->dwType != UNIT_PLAYER || !player->pPath ||
         !player->pPath->pRoom1 || !player->pPath->pRoom1->pRoom2 ||
         !player->pPath->pRoom1->pRoom2->pLevel)
@@ -1315,12 +1316,14 @@ RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel) 
                 D2COMMON_GetUnitStat(unit, STAT_ALIGNMENT, 0) != 0 ||
                 unit->dwMode == NPC_MODE_DEATH || unit->dwMode == NPC_MODE_DEAD)
                 continue;
-            if (static_cast<int>(D2COMMON_GetUnitStat(unit, 6, 0)) > 0)
-                return RoomClearState::LivingHostiles;
+            if (static_cast<int>(D2COMMON_GetUnitStat(unit, 6, 0)) > 0) {
+                if (!remaining) return RoomClearState::LivingHostiles;
+                ++*remaining;
+            }
         }
     }
     if (!rooms) return RoomClearState::Unavailable;
-    return AreaPopulation::QueryInactiveRoomClear(game, player, expectedLevel);
+    return AreaPopulation::QueryInactiveRoomClear(game, player, expectedLevel, remaining);
 }
 
 json Execute(void* game, UnitAny* serverPlayer, const Request& request) {
@@ -1330,8 +1333,9 @@ json Execute(void* game, UnitAny* serverPlayer, const Request& request) {
     std::string error;
     if (!Bind(error)) return Failure(error);
     if (request.operation == Operation::Area) {
-        if (!CharacterState::BindingsReady() || !Readable(game, 0xAC))
-            return Failure("native server player readiness bindings unavailable");
+        if (!Readable(game, 0xAC))
+            return Failure("native server game context unavailable");
+        const bool characterBindingsReady = CharacterState::BindingsReady();
         Level* area = room->pRoom2->pLevel;
         auto bounds = [](Room2* metadata) {
             return json{{"x", metadata->dwPosX * 5}, {"y", metadata->dwPosY * 5},
@@ -1345,7 +1349,8 @@ json Execute(void* game, UnitAny* serverPlayer, const Request& request) {
             {"mode", serverPlayer->dwMode},
             {"level", gGetter(serverPlayer, 12, 0)},
             {"experience", static_cast<DWORD>(gGetter(serverPlayer, 13, 0))},
-            {"skill_delay_active", D2COMMON_GetUnitState(serverPlayer, 121) != 0},
+            {"skill_delay_active", characterBindingsReady ?
+                json(D2COMMON_GetUnitState(serverPlayer, 121) != 0) : json(nullptr)},
             {"position", {{"x", serverPlayer->pPath->xPos}, {"y", serverPlayer->pPath->yPos}}},
             {"life", gGetter(serverPlayer, 6, 0) / 256.0},
             {"mana", gGetter(serverPlayer, 8, 0) / 256.0},
@@ -1359,7 +1364,7 @@ json Execute(void* game, UnitAny* serverPlayer, const Request& request) {
             {"path_type", path->dwPathType}};
         result["game_frame"] = *reinterpret_cast<const DWORD*>(reinterpret_cast<const BYTE*>(game) + 0xA8);
         auto selectedSkill = [&](Skill* selected) -> json {
-            if (!Valid(selected) || !Valid(selected->pSkillInfo)) return nullptr;
+            if (!characterBindingsReady || !Valid(selected) || !Valid(selected->pSkillInfo)) return nullptr;
             return {{"id", selected->pSkillInfo->wSkillId},
                 {"hard_points", selected->skillLevel},
                 {"effective_level", D2COMMON_GetSkillLevel(serverPlayer, selected, TRUE)},

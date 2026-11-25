@@ -44,10 +44,10 @@ bool Readable(const void* p, size_t bytes) {
 }
 template <typename T> bool Valid(const T* p) { return Readable(p, sizeof(T)); }
 json Failure(const char* error) { return {{"ok", false}, {"error", error}}; }
-// Bounded, stats-only diagnostics for a mismatched loaded S13 table. Never
+// Bounded, stats-only diagnostics for a mismatched loaded S14 table. Never
 // reinterpret unverified rows as catalog metadata.
 json StatLayoutFailure(const sgptDataTable* tables) {
-    json result = Failure("stat metadata layout incompatible with indexed S13 records");
+    json result = Failure("stat metadata layout incompatible with indexed S14 records");
     json diagnostic = {{"sdk_record_bytes", sizeof(ItemStatCostTxt)},
         {"sdk_stat_offset", offsetof(ItemStatCostTxt, wStat)},
         {"sdk_value_shift_offset", offsetof(ItemStatCostTxt, bValShift)},
@@ -57,11 +57,11 @@ json StatLayoutFailure(const sgptDataTable* tables) {
         {"sdk_save_param_bits_offset", offsetof(ItemStatCostTxt, dwSaveParamBits)},
         {"sdk_table_pointer_offset", offsetof(sgptDataTable, pItemStatCostTxt)},
         {"sdk_table_count_offset", offsetof(sgptDataTable, dwItemStatCostRecs)},
-        {"loaded_lookup_matches_s13", S13ItemStatCostLookupMatches()},
+        {"loaded_lookup_matches_s14", S14ItemStatCostLookupMatches()},
         {"record_count", tables->dwItemStatCostRecs}};
     const BYTE* mod = reinterpret_cast<const BYTE*>(GetModuleHandleA("ProjectDiablo.dll"));
-    if (mod && Readable(mod + 0x2CE6D0, 0x29)) {
-        const BYTE* code = mod + 0x2CE6D0;
+    if (mod && Readable(mod + 0x37C2B0, 0x29)) {
+        const BYTE* code = mod + 0x37C2B0;
         constexpr char hex[] = "0123456789abcdef";
         std::string bytes(0x29 * 2, '0');
         for (size_t i = 0; i < 0x29; ++i) {
@@ -73,7 +73,7 @@ json StatLayoutFailure(const sgptDataTable* tables) {
             DWORD operand = 0;
             std::memcpy(&operand, code + 1, sizeof(operand));
             const uintptr_t base = reinterpret_cast<uintptr_t>(mod);
-            if (operand >= base && operand - base < 0x536000)
+            if (operand >= base && operand - base < 0x5F3000)
                 diagnostic["mod_getter_global_rva"] = operand - base;
         }
     }
@@ -784,7 +784,7 @@ json Catalog(const json& args) {
         if (!Readable(p_D2COMMON_sgptDataTable, sizeof(sgptDataTable*)) ||
             !Valid(*p_D2COMMON_sgptDataTable)) return Failure("stat metadata unavailable");
         const sgptDataTable* tables = *p_D2COMMON_sgptDataTable;
-        if (!S13ItemStatCostLayoutValid(tables))
+        if (!S14ItemStatCostLayoutValid(tables))
             return StatLayoutFailure(tables);
         count = tables->dwItemStatCostRecs;
         const unsigned end = std::min(count, offset + limit);

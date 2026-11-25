@@ -1,4 +1,4 @@
-"""Lossless writer for typed English entries in the S13 patchstring table."""
+"""Lossless writer for typed English entries in a PD2 patchstring table."""
 from __future__ import annotations
 
 import binascii
@@ -135,7 +135,7 @@ def _serialize(version: int, rows: list[tuple[bytes, bytes]]) -> bytes:
 
 def add_english(data: bytes, entries: list[tuple[str, str]], *,
                 allow_multiline_keys=()) -> bytes:
-    """Append collision-checked namespaced English strings to an S13 TBL."""
+    """Append collision-checked namespaced English strings to a PD2 TBL."""
     version, rows = _parse(data)
     if not isinstance(entries, list):
         raise ValueError("Localized entries must be a list")

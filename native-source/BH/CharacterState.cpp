@@ -16,10 +16,10 @@
 namespace {
 using json = nlohmann::json;
 
-// These offsets/strides are used by S13 D2Common exports 10044 (RVA 4E550),
+// These offsets/strides are used by S14 D2Common exports 10044 (RVA 4E550),
 // 10587 (38C20), 10973 (38B70), 10306 (505C0). The experience compiler
 // descriptor at 5C4E0 installs a 0x20-byte row table at table offset C78.
-static_assert(sizeof(void*) == 4, "S13 is an x86 game");
+static_assert(sizeof(void*) == 4, "S14 is an x86 game");
 static_assert(offsetof(sgptDataTable, pPlayerSkillCount) == 0xBA4, "skill count ABI");
 static_assert(offsetof(sgptDataTable, pPlayerSkillList) == 0xBAC, "skill slot ABI");
 static_assert(offsetof(sgptDataTable, pExperience) == 0xC78, "experience ABI");
@@ -402,7 +402,7 @@ bool BindingsReady() {
         0x33,0xc0,0xc2,0x0c,0x00,0x53,0x57,0x8b,0x7c,0x24,0x10,0x85,0xff,0x7c,0x27,0x8b};
     static const BYTE total[] = {0x8b,0x44,0x24,0x04,0x85,0xc0,0x75,0x03,
         0xc2,0x0c,0x00,0x53,0x8b,0x58,0x5c,0x85,0xdb,0x75,0x06,0x33,0xc0,0x5b,0xc2,0x0c};
-    static const BYTE use[] = {0x57,0x8b,0x7c,0x24,0x0c,0x85,0xff,0x75,0x1f,0x68,
+    BYTE use[] = {0x57,0x8b,0x7c,0x24,0x0c,0x85,0xff,0x75,0x1f,0x68,
         0xea,0x08,0x00,0x00,0xe8,0xc9,0x6e,0xfb,0xff,0x50};
     static const BYTE mode[] = {0x8b,0x44,0x24,0x04,0x85,0xc0,0x74,0x0e,0x8b,0x44,
         0x24,0x08,0x85,0xc0,0x74,0x06,0x8b,0x40,0x08,0xc2};
@@ -410,14 +410,30 @@ bool BindingsReady() {
     static const Site sites[] = {
         {10306,0x505c0,skill,sizeof(skill)}, {10494,0x33cd0,state,sizeof(state)},
         {10587,0x38c20,base,sizeof(base)}, {10973,0x38b70,total,sizeof(total)},
-        {10787,0x52340,use,sizeof(use)}, {10952,0x4e460,mode,sizeof(mode)}};
+        {10952,0x4e460,mode,sizeof(mode)}};
     for (const Site& site : sites) {
         const BYTE* address = reinterpret_cast<const BYTE*>(common) + site.rva;
         if (GetProcAddress(common, MAKEINTRESOURCEA(site.ordinal)) != reinterpret_cast<FARPROC>(address) ||
             !Readable(address, site.size) || std::memcmp(address, site.bytes, site.size))
             return false;
     }
-    return true;
+    const BYTE* useEntry = reinterpret_cast<const BYTE*>(common) + 0x52340;
+    if (GetProcAddress(common, MAKEINTRESOURCEA(10787)) != reinterpret_cast<FARPROC>(useEntry))
+        return false;
+    if (BoundCode(useEntry, use, sizeof(use), common)) return true;
+    // Official S14 redirects this export after loading D2Common.
+    HMODULE mod = GetModuleHandleA("ProjectDiablo.dll");
+    std::string error;
+    static const BYTE redirect[] = {0x55,0x8b,0xec,0x53,0x8b,0x5d,0x08,0x56,
+        0x8b,0x75,0x0c,0x57,0x85,0xdb,0x74,0x7c,0x83,0x3b,0x00,0x75,0x77};
+    if (!mod || !LabProfile::VerifyMod(error)) return false;
+    const BYTE* target = reinterpret_cast<const BYTE*>(mod) + 0x2fc1e0;
+    const DWORD displacement = reinterpret_cast<uintptr_t>(target) -
+        (reinterpret_cast<uintptr_t>(useEntry) + 5);
+    use[0] = 0xe9;
+    std::memcpy(use + 1, &displacement, sizeof(displacement));
+    return BoundCode(useEntry, use, sizeof(use), common) &&
+        BoundCode(target, redirect, sizeof(redirect), mod);
 }
 bool SetProgression(void* game, UnitAny* player, ProgressionField field, uint32_t value) {
     return ApplyProgression(game, player, field, value);
@@ -577,7 +593,7 @@ bool AwardClearLevel(void* game, UnitAny* player) {
 json Catalog(const json& args) {
     unsigned id;
     if (!ClassId(args, id)) return Error("class_id must be an integer from 0 to 6");
-    if (!BindingsReady()) return Error("S13 character bindings changed");
+    if (!BindingsReady()) return Error("S14 character bindings changed");
     sgptDataTable* tables = Tables();
     if (!tables || tables->dwCharsStatsRecs < 7 || tables->dwCharsStatsRecs > 64 ||
         !Readable(tables->pCharStatsTxt, sizeof(CharStatsTxt) * 7) ||
@@ -650,7 +666,7 @@ json Catalog(const json& args) {
 
 json Inspect(const json& args) {
     if (!args.is_object() || !args.empty()) return Error("get_build_state takes no arguments");
-    if (!BindingsReady()) return Error("S13 character bindings changed");
+    if (!BindingsReady()) return Error("S14 character bindings changed");
     if (!IsGameReady()) return Error("game is not ready");
     UnitAny* player = D2CLIENT_GetPlayerUnit();
     if (!Valid(player) || player->dwType != UNIT_PLAYER || player->dwTxtFileNo > 6 ||

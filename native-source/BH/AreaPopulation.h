@@ -12,5 +12,5 @@ namespace AreaPopulation {
 bool AppendInactive(void* game, UnitAny* player, nlohmann::json& census, std::string& error);
 bool PrepareRoomClear(std::string& error);
 // Game-thread query. No diagnostic census, allocations or retained game pointers.
-ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* player, unsigned expectedLevel);
+ServerMonsters::RoomClearState QueryInactiveRoomClear(void* game, UnitAny* player, unsigned expectedLevel, unsigned* remaining);
 }

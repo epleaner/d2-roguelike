@@ -244,7 +244,7 @@ struct WssBindings {
     WssApplyProperty apply = nullptr;
 };
 WssBindings wssBindings;
-static_assert(sizeof(CubeMainTxt) == 0x148, "pinned S13 cube recipe stride");
+static_assert(sizeof(CubeMainTxt) == 0x148, "S14 cube recipe stride (unchanged D2Common ABI)");
 struct WssCubeMainTable {
     WssCubeMainCount count = nullptr;
     WssCubeMainRecord record = nullptr;
@@ -254,7 +254,7 @@ bool PrepareWssBindings(std::string& error) {
     if (wssBindings.count && wssBindings.record && wssBindings.apply) return true;
     if (!LabProfile::VerifyCommon(error)) return false;
     HMODULE module = GetModuleHandleA("D2Common.dll");
-    if (!module) { error = "S13 D2Common module unavailable"; return false; }
+    if (!module) { error = "S14 D2Common module unavailable"; return false; }
     const FARPROC countExport = GetProcAddress(module, MAKEINTRESOURCEA(10675));
     const FARPROC recordExport = GetProcAddress(module, MAKEINTRESOURCEA(10783));
     const BYTE* countCode = reinterpret_cast<const BYTE*>(countExport);
@@ -267,7 +267,7 @@ bool PrepareWssBindings(std::string& error) {
         !Readable(property, sizeof(propertySignature)) ||
         memcmp(property, propertySignature, sizeof(propertySignature)) ||
         reinterpret_cast<const BYTE*>(GetProcAddress(module, MAKEINTRESOURCEA(10914))) != property) {
-        error = "unrecognized S13 CubeMain bindings";
+        error = "unrecognized S14 CubeMain bindings";
         return false;
     }
     wssBindings = {reinterpret_cast<WssCubeMainCount>(countExport),
@@ -281,7 +281,7 @@ bool WssLoadCubeMainTable(WssCubeMainTable& table, std::string& error) {
     const auto record = wssBindings.record;
     const int total = count();
     if (total <= 0 || total > 32768) {
-        error = "S13 D2Common CubeMain record count is invalid";
+        error = "S14 D2Common CubeMain record count is invalid";
         return false;
     }
     table = {count, record, static_cast<DWORD>(total)};
@@ -290,12 +290,12 @@ bool WssLoadCubeMainTable(WssCubeMainTable& table, std::string& error) {
 bool WssCubeMainRow(const WssCubeMainTable& table, DWORD index,
     const CubeMainTxt*& row, std::string& error) {
     if (!table.record || index >= table.total) {
-        error = "S13 CubeMain row index is outside the loaded table";
+        error = "S14 CubeMain row index is outside the loaded table";
         return false;
     }
     CubeMainTxt* loaded = table.record(static_cast<int>(index));
     if (!Readable(loaded, sizeof(*loaded))) {
-        error = "S13 CubeMain record is unreadable";
+        error = "S14 CubeMain record is unreadable";
         return false;
     }
     row = loaded;
@@ -340,13 +340,13 @@ bool WssFindRandomizer(const WssCubeMainTable& cube,
             continue;
         if (!WssCorruptnumRange(
                 recipe, records, wssBaseId, minimum, maximum)) {
-            error = "matching S13 WSS randomizer has an unsupported output";
+            error = "matching S14 WSS randomizer has an unsupported output";
             return false;
         }
         rowIndex = index;
         return true;
     }
-    error = "loaded S13 CubeMain has no matching WSS corruptnum randomizer";
+    error = "loaded S14 CubeMain has no matching WSS corruptnum randomizer";
     return false;
 }
 bool WssSelectCorruption(UnitAny* item, DWORD seed,
@@ -354,18 +354,18 @@ bool WssSelectCorruption(UnitAny* item, DWORD seed,
     D2ItemDataTbl* bases = nullptr;
     sgptDataTable* records = nullptr;
     if (!RewardTables(bases, records)) {
-        error = "loaded S13 reward base or item-type tables are unavailable";
+        error = "loaded S14 reward base or item-type tables are unavailable";
         return false;
     }
     if (!WssPropertiesTableValid(records)) {
-        error = "loaded S13 Properties.txt table is unavailable";
+        error = "loaded S14 Properties.txt table is unavailable";
         return false;
     }
     WssCubeMainTable cube;
     if (!WssLoadCubeMainTable(cube, error)) return false;
     const int wssBaseId = WssBaseId(bases);
     if (wssBaseId < 0) {
-        error = "loaded S13 item table has no unique WSS base code";
+        error = "loaded S14 item table has no unique WSS base code";
         return false;
     }
     int rollMinimum = 0, rollMaximum = 0;
@@ -395,7 +395,7 @@ bool WssSelectCorruption(UnitAny* item, DWORD seed,
             previous, threshold);
     }
     if (!totalWeight) {
-        error = "loaded S13 WSS selector has no non-bricking unique outcomes";
+        error = "loaded S14 WSS selector has no non-bricking unique outcomes";
         return false;
     }
     std::minstd_rand random(seed ? seed : 1);
@@ -437,7 +437,7 @@ bool WssSelectCorruption(UnitAny* item, DWORD seed,
         previous = RoguelikeLoot::WssThresholdCoverage(
             previous, threshold);
     }
-    error = "loaded S13 WSS valid-outcome weights changed during selection";
+    error = "loaded S14 WSS valid-outcome weights changed during selection";
     return false;
 }
 json WssCorruptionJson(const WssCorruptionSelection& selected) {
@@ -466,7 +466,7 @@ json WssCorruptionJson(const WssCorruptionSelection& selected) {
             {"quantity", selector.Quantity}});
     }
     return {
-        {"source", "loaded_s13_cubemain_wss"},
+        {"source", "loaded_s14_cubemain_wss"},
         {"randomizer_row", selected.randomizerIndex},
         {"recipe_row", selected.recipeIndex},
         {"roll_minimum", selected.rollMinimum},
@@ -486,7 +486,7 @@ bool ApplyWssCorruption(void* game, UnitAny* item, DWORD seed,
     const DWORD propertyPool = *reinterpret_cast<const DWORD*>(
         static_cast<const BYTE*>(game) + 0x70);
     if (!propertyPool) {
-        error = "S13 native item property pool is unavailable";
+        error = "S14 native item property pool is unavailable";
         return false;
     }
     const auto apply = wssBindings.apply;

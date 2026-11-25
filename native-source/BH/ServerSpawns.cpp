@@ -21,6 +21,7 @@
 #include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <random>
 #include <climits>
 #include <intrin.h>
@@ -45,6 +46,7 @@ struct RunLayout {
     std::array<RunTile, 4> actors{};
     std::array<RunTile, 3> portals{};
     unsigned actorCount = 0;
+    Room1* portalRoom = nullptr;
 };
 namespace ServerSpawns {
     void OfferChoices(void* game, int level, const RunLayout* layout = nullptr);
@@ -55,7 +57,8 @@ namespace ServerSpawns {
         const std::array<std::uint16_t, 2>& excludedPrimaries,
         unsigned excludedCount,
         RoguelikeProgression::EncounterSelection& selection,
-        int& densityBaseline, std::string& error);
+        int& densityBaseline, std::string& error,
+        unsigned availableActs = RoguelikeProgression::allCampaignActs);
     nlohmann::json RunSnapshotStatus();
 }
 namespace {
@@ -231,6 +234,7 @@ const SkillsTxt* RunAuraSkill(const RoguelikeAura::Config* config);
 std::atomic<bool> runStarterSettled{false};
 std::atomic<bool> runBossKillWitness{false}; // Server-certified death; client only requests a later census.
 std::atomic<bool> runClearRetry{false}; // A witnessed clear awaits a stable room snapshot.
+std::atomic<bool> runChoicePlacementPending{false};
 int runArrivalLevel = 0; // Server-thread-only target while the fresh room is constructed.
 int runRootLevel = 0; // First active run area; 20 is the authored Tower.
 void* runAreaUsageGame = nullptr;
@@ -239,7 +243,9 @@ std::array<bool, 255> runUsedAreas{}; // Consumed during the active run; resume 
 std::array<bool, 255> runCleared{};
 std::array<bool, 255> runRetiredDestinations{}; // Rerolled-away IDs are never offered again.
 std::array<bool, 255> runPopulationReady{};
-std::array<BYTE, 255> runEncounters{}; // 0 awaiting, 1 natural, 2 seeded, 3 failed.
+constexpr BYTE kEncounterDegraded = 4;
+std::array<BYTE, 255> runEncounters{}; // 0 awaiting, 1 natural, 2 seeded, 3 failed, 4 degraded.
+std::string runEncounterWarning; // Only exposed for the active degraded room.
 std::array<DWORD, 255> runBossUnit{};
 struct BossDamageSource { DWORD id = 0; UnitAny* unit = nullptr; WORD nativeLevel = 0; };
 std::array<BossDamageSource, 32> runBossDamageSources{};
@@ -274,6 +280,9 @@ std::array<std::uint64_t, 2048> runKillLootLedger{};
 int runKillLootLedgerLevel = 0;
 unsigned runChoiceSerial = 0;
 std::uint64_t runEntrySerial = 0;
+enum class AutoEntrance { Waiting, Queued, Handled };
+std::atomic<AutoEntrance> autoEntrance{AutoEntrance::Waiting};
+constexpr char kAutoEntranceCommand[] = "run autostart";
 std::uint64_t runActiveSerial = 0;
 constexpr unsigned kZoneAreaAffix = 0x10000;
 const AutoMagicTxt* ZoneAffix(unsigned id) {
@@ -309,7 +318,49 @@ json ZoneAffixReceipt(const RoguelikeAffixes::Roll& roll) {
 }
 bool Readable(const void* address, size_t size);
 bool PortalArea(UnitAny* player, int expected);
-// D2Client S13 RVA A5D90 receives UnitAny in EAX; this getter is not the
+// Authenticated client level-entry renderer; non-run areas retain the stock DC6.
+using EntryBanner = void (__cdecl*)();
+EntryBanner originalEntryBanner = nullptr;
+std::atomic<int> drawnEntryBannerArea{0};
+void __cdecl AbyssEntryBanner() {
+    static int lastArea = 0;  // Only the client render thread calls this.
+    static DWORD started = 0;
+    const int area = runStage.load(std::memory_order_acquire);
+    if (area <= 1 || !PortalArea(D2CLIENT_GetPlayerUnit(), area)) {
+        if (lastArea) {
+            lastArea = 0;
+            drawnEntryBannerArea.store(0, std::memory_order_release);
+        }
+        originalEntryBanner();
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (lastArea == area && now - started >= 2400) return;
+    constexpr wchar_t prefix[] = L"The Abyss - Level ";
+    const wchar_t* name = D2CLIENT_GetLevelName(area);
+    if (!Readable(name, 40 * sizeof(wchar_t)) ||
+        wcsncmp(name, prefix, _countof(prefix) - 1) ||
+        !wmemchr(name, L'\0', 40)) {
+        originalEntryBanner();
+        return;
+    }
+    const bool firstFrame = lastArea != area;
+    if (firstFrame) {
+        lastArea = area;
+        started = now;
+    }
+    const DWORD font = D2WIN_SetTextSize(3);
+    DWORD width = 0, fontFile = 0;
+    wchar_t title[40];
+    wcscpy_s(title, name);
+    D2WIN_GetTextWidthFileNo(title, &width, &fontFile);
+    D2WIN_DrawText(title, (int(*p_D2CLIENT_ScreenSizeX) - int(width)) / 2,
+        int(*p_D2CLIENT_ScreenSizeY) / 3, 4, 0);
+    D2WIN_SetTextSize(font);
+    if (firstFrame)
+        drawnEntryBannerArea.store(area, std::memory_order_release);
+}
+// D2Client S14 Patch #2 (unchanged from S13) RVA A5D90 receives UnitAny in EAX; this getter is not the
 // portal-special hover renderer. Never mutate shared ObjectTxt (class 60).
 struct ChoiceName {
     DWORD playerId;
@@ -1127,6 +1178,17 @@ bool InstallChoiceNames(std::string& error) {
     originalStockFill = reinterpret_cast<StockFill>(filler);
     BYTE* getter = client ? client + 0xA5D90 : nullptr;
     BYTE* hover = client ? client + 0xC1085 : nullptr;
+    BYTE* entryBanner = client ? client + 0xBF0D0 : nullptr;
+    const BYTE entryPrefix[] = {0x81,0xec,0x28,0x01,0x00,0x00,0x85,0xc0,0x56,0x74,0x0a};
+    DWORD bannerPlayer = 0;
+    if (Readable(entryBanner, 5 + sizeof(entryPrefix)))
+        memcpy(&bannerPlayer, entryBanner + 1, sizeof(bannerPlayer));
+    if (bannerPlayer == reinterpret_cast<DWORD>(client) + 0x11BBFC &&
+        entryBanner[0] == 0xa1 && !memcmp(entryBanner + 5, entryPrefix, sizeof(entryPrefix)) &&
+        D2WIN_SetTextSize && D2WIN_GetTextWidthFileNo && D2WIN_DrawText)
+        originalEntryBanner = reinterpret_cast<EntryBanner>(entryBanner);
+    else
+        OutputDebugStringA("Roguelike: pinned entry banner unavailable; preserving stock drawing.\n");
     const BYTE before[] = {0x8b,0x4d,0x14,0x0f,0xb6,0x71,0x04};
     const BYTE call[] = {0xe8,0xb6,0xd1,0xff,0xff};
     const BYTE after[] = {0x8b,0xd0,0x8d,0x8c,0x24,0x98,0x01,0x00,0x00};
@@ -1197,6 +1259,8 @@ bool InstallChoiceNames(std::string& error) {
     CloseHandle(snapshot);
     if (!ok || endError != ERROR_NO_MORE_FILES ||
         DetourAttach(&originalUnitName, reinterpret_cast<void*>(UnitNameHook)) != NO_ERROR ||
+        (originalEntryBanner && DetourAttach(reinterpret_cast<void**>(&originalEntryBanner),
+            reinterpret_cast<void*>(AbyssEntryBanner)) != NO_ERROR) ||
         DetourAttach(&originalHoverCall, reinterpret_cast<void*>(PortalHoverHook)) != NO_ERROR ||
         DetourAttach(&originalStockLevel, reinterpret_cast<void*>(StockLevelHook)) != NO_ERROR ||
         DetourAttach(&originalStoreItem, reinterpret_cast<void*>(StoreItemHook)) != NO_ERROR ||
@@ -1663,20 +1727,26 @@ bool RewardBaseItemTypeValid(const sgptDataTable* itemTypes,
     return Readable(&itemTypes->pItemsTypeTxt[row.nType],
         sizeof(D2ItemTypesTxt));
 }
+// Bulk reward selection has already authenticated both compiled table ranges.
+bool RewardBaseEligible(const D2ItemDataTbl& table, const ItemsTxt& base,
+    int index, bool starter, int sockets, RoguelikeLoot::BaseKind kind,
+    int charmSize) {
+    const int equipmentCount =
+        table.nWeaponsTxtRecordCount + table.nArmorTxtRecordCount;
+    if (kind == RoguelikeLoot::BaseKind::Equipment)
+        return index < equipmentCount &&
+            (!sockets || base.bgemsockets >= sockets) &&
+            (!starter || (base.wreqstr <= 25 && base.wreqdex <= 25));
+    if (index < equipmentCount) return false;
+    return RoguelikeLoot::RewardSpecialBaseCode(base.szCode, kind, charmSize);
+}
 bool RewardBase(const D2ItemDataTbl* table, const sgptDataTable* itemTypes,
     int index, int itemLevel, int playerLevel, bool starter, int sockets,
     RoguelikeLoot::BaseKind kind, int charmSize) {
     const ItemsTxt* base = RewardBaseRow(
         table, index, itemLevel, playerLevel, starter, kind);
-    if (!base || !RewardBaseItemTypeValid(itemTypes, *base)) return false;
-    const int equipmentCount =
-        table->nWeaponsTxtRecordCount + table->nArmorTxtRecordCount;
-    if (kind == RoguelikeLoot::BaseKind::Equipment)
-        return index < equipmentCount &&
-            (!sockets || base->bgemsockets >= sockets) &&
-            (!starter || (base->wreqstr <= 25 && base->wreqdex <= 25));
-    if (index < equipmentCount) return false;
-    return RoguelikeLoot::RewardSpecialBaseCode(base->szCode, kind, charmSize);
+    return base && RewardBaseItemTypeValid(itemTypes, *base) &&
+        RewardBaseEligible(*table, *base, index, starter, sockets, kind, charmSize);
 }
 bool RewardItemTypesValid(const sgptDataTable* records) {
     if (!records || !Readable(records, sizeof(*records))) return false;
@@ -1749,9 +1819,9 @@ int MatchingRewardBase(const D2ItemDataTbl* bases,
     const sgptDataTable* records, const char* code, int itemLevel,
     int playerLevel, RoguelikeLoot::BaseKind kind, int charmSize) {
     for (int base = 0; base < bases->nItemsTxtRecordCount; ++base)
-        if (RewardBase(bases, records, base, itemLevel, playerLevel, false, 0,
-                kind, charmSize) &&
-            !memcmp(code, bases->pItemsTxt[base].szCode, 3))
+        if (!memcmp(code, bases->pItemsTxt[base].szCode, 3) &&
+            RewardBase(bases, records, base, itemLevel, playerLevel, false, 0,
+                kind, charmSize))
             return base;
     return -1;
 }
@@ -1824,8 +1894,11 @@ void SelectOrdinaryRewardBases(Pending& reward, const D2ItemDataTbl* bases,
     unsigned highestEligible = 0;
     unsigned preferredEligible = 0;
     for (int base = 0; base < bases->nItemsTxtRecordCount; ++base) {
-        if (!RewardBase(bases, records, base, itemLevel, playerLevel,
-                starter, sockets, kind, charmSize)) continue;
+        const ItemsTxt& row = bases->pItemsTxt[base];
+        if (row.nType >= records->dwItemsTypeRecs ||
+            !RewardBaseRowEligible(row, itemLevel, playerLevel, starter, kind) ||
+            !RewardBaseEligible(*bases, row, base, starter, sockets, kind, charmSize))
+            continue;
         if (sockets && MaximumNativeSockets(
                 bases, records, base, itemLevel) < static_cast<unsigned>(sockets))
             continue;
@@ -1862,7 +1935,8 @@ bool SelectReward(Pending& reward, int itemLevel, int playerLevel, bool starter,
     unsigned excludedUniqueCount = 0) {
     D2ItemDataTbl* bases = nullptr;
     sgptDataTable* records = nullptr;
-    if (!RewardTables(bases, records)) return false;
+    if (!RewardLevelsValid(itemLevel, playerLevel) || !RewardTables(bases, records))
+        return false;
     std::minstd_rand random(entropy ? entropy : 1);
     unsigned eligible = 0;
     bool recordsValid = true;
@@ -1882,7 +1956,7 @@ bool SelectReward(Pending& reward, int itemLevel, int playerLevel, bool starter,
         const int requestedQuality = reward.quality;
         for (unsigned attempt = 0;; ++attempt) {
             const int quality = RoguelikeLoot::RewardQualityAttempt(
-                requestedQuality, attempt, sockets != 0);
+                requestedQuality, attempt, sockets != 0, starter);
             if (quality < 0) break;
             reward.quality = quality;
             reward.baseId = -1;
@@ -1989,6 +2063,15 @@ bool RewardBaseIsPotion(const D2ItemDataTbl* bases,
             return true;
     return false;
 }
+unsigned EquipmentQualityRoll(DWORD entropy) {
+    std::minstd_rand random(entropy ? entropy : 1);
+    return static_cast<unsigned>(random()) % RoguelikeLoot::kBasisPoints;
+}
+int RunEquipmentQuality(int quality, int playerLevel, DWORD seed, bool firstZone) {
+    if (firstZone) return 4;
+    return quality == 2 && RoguelikeLoot::EarlyMagicRoll(
+        playerLevel, EquipmentQualityRoll(seed)) ? 4 : quality;
+}
 UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
     if (RoguelikeOwnedChestDropContext(game, drop)) {
         bool potion = false;
@@ -2006,6 +2089,7 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
     int area = -1;
     if (!RoguelikeMonsterDropContext(game, drop, area))
         return originalNaturalDrop(game, drop, flags);
+    const bool firstZone = area == runRootLevel;
     const bool monsterZone = zoneSlots[area].configured &&
         zoneSlots[area].kind == Pending::ZoneKind::Monster;
     const bool combatZone = monsterZone ||
@@ -2015,7 +2099,7 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
         return nullptr;
     D2ItemDataTbl* bases = nullptr;
     sgptDataTable* records = nullptr;
-    if (!monsterZone || !RewardTables(bases, records) ||
+    if ((!monsterZone && !firstZone) || !RewardTables(bases, records) ||
         drop->baseId < 0 ||
         drop->baseId >= bases->nWeaponsTxtRecordCount +
             bases->nArmorTxtRecordCount)
@@ -2023,10 +2107,16 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
     ++naturalEquipmentCalls;
     naturalEquipmentQuality = drop->quality;
     naturalEquipmentBase = drop->baseId;
-    ++naturalEquipmentForced;
-    const int quality =
+    const int baseQuality =
         zoneSlots[area].affixes.quality == RoguelikeAffixes::Quality::Magic ? 4 :
         zoneSlots[area].affixes.quality == RoguelikeAffixes::Quality::Rare ? 6 : 2;
+    int quality = RunEquipmentQuality(baseQuality, MarketCharacterLevel(), drop->seed, firstZone);
+    if ((firstZone || quality != baseQuality) &&
+        !RewardQualityAllowed(bases, records, drop->baseId, quality)) {
+        if (firstZone) return originalNaturalDrop(game, drop, flags);
+        quality = baseQuality;
+    }
+    ++naturalEquipmentForced;
     drop->quality = quality;
     UnitAny* item = originalNaturalDrop(game, drop, flags);
     if (!item) {
@@ -2267,19 +2357,19 @@ json DropRunMaterial(void* game, UnitAny* player, int itemLevel, int playerLevel
     }
     return {{"ok", true}, {"item_id", generated.item->dwUnitId}};
 }
-int MonsterDropQuality(int itemLevel, DWORD entropy) {
-    std::minstd_rand random(entropy ? entropy : 1);
-    const unsigned roll = static_cast<unsigned>(random()) %
-        MerchantQuality::kBasisPoints;
-    return MerchantQuality::ToItemQuality(
+int MonsterDropQuality(int itemLevel, int playerLevel, DWORD entropy) {
+    const unsigned roll = EquipmentQualityRoll(entropy);
+    const int quality = MerchantQuality::ToItemQuality(
         MerchantQuality::Select(itemLevel, roll), 2);
+    return quality == 2 && RoguelikeLoot::EarlyMagicRoll(
+        playerLevel, roll, MerchantQuality::AtLevel(itemLevel).white) ? 4 : quality;
 }
 json DropRunCategory(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int playerLevel, RoguelikeLoot::BaseKind kind,
     DWORD entropy, int charmSize = 0) {
     const DWORD qualitySeed = entropy ^ 0xa511e9b3u;
     const DWORD baseSeed = entropy ^ 0x63d83595u;
-    int quality = MonsterDropQuality(itemLevel, qualitySeed);
+    int quality = MonsterDropQuality(itemLevel, playerLevel, qualitySeed);
     const bool charm = kind == RoguelikeLoot::BaseKind::Charm;
     if (charm && (quality == 5 || quality == 6)) quality = 4;
     if (charm && !charmSize)
@@ -2322,9 +2412,11 @@ json DropMonsterItem(void* game, UnitAny* player, UnitAny* monster,
     DWORD entropy, unsigned materialSlot) {
     switch (kind) {
     case RoguelikeLoot::DropKind::Equipment: {
-        const int quality = MonsterDropQuality(playerLevel, entropy ^ 0xa511e9b3u);
+        const bool firstZone = runRootLevel == runStage.load(std::memory_order_acquire);
+        const int quality = firstZone ? 4 :
+            MonsterDropQuality(playerLevel, playerLevel, entropy ^ 0xa511e9b3u);
         json reward = DropRunReward(game, player, itemLevel, playerLevel,
-            quality, false, entropy, 0, monster);
+            quality, firstZone, entropy, 0, monster);
         if (!reward.value("ok", false) && (quality == 5 || quality == 7) &&
             reward.value("error", "") ==
                 "no compiled level-eligible reward base and quality")
@@ -2416,9 +2508,9 @@ bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
     }
     return true;
 }
-// S13 D2Game RVA A24C0: EAX=actor, stack=(game, room, x, y, destination,
-// source-object-out, object-class, permanent), callee RET 20h. Null actor
-// bypasses the town-only Cow/Uber gate at A24FC; never call with a player.
+// S14 D2Game RVA A24C0 (the image is byte-identical to S13 Patch #2): EAX=actor,
+// stack=(game, room, x, y, destination, source-object-out, object-class,
+// permanent), callee RET 20h. Null actor bypasses the town-only Cow/Uber gate at A24FC.
 using PortalConstructor = int (__stdcall*)(void*, Room1*, int, int, int, UnitAny**, int, int);
 const BYTE* VerifiedPortalEntry(std::string& error) {
     if (!LabProfile::VerifyServer(error)) return nullptr;
@@ -2428,15 +2520,10 @@ const BYTE* VerifiedPortalEntry(std::string& error) {
     const BYTE signature[] = {0x83,0xec,0x0c,0x55,0x8b,0x6c,0x24,0x18,
         0x85,0xed,0x56,0x8b,0xf0,0x75,0x1f};
     if (!Readable(entry, sizeof(signature)) || memcmp(entry, signature, sizeof(signature))) {
-        error = "unrecognized S13 portal constructor";
+        error = "unrecognized pinned S14 portal constructor";
         return nullptr;
     }
-    std::string digest;
-    if (!LabProfile::ModFileIdentity(digest) ||
-        digest != "538a77b7ccef3d5334e56c4e9e57a4d8fc69a1e27c46beb694c0dedfcfbf9cb3") {
-        error = "unrecognized S13 PD2 module";
-        return nullptr;
-    }
+    if (!LabProfile::VerifyMod(error)) return nullptr;
     return entry;
 }
 // S13 D2Game RVA E03A0: ECX=game, EDX=unit ID, EAX=unit type.
@@ -2481,7 +2568,7 @@ struct TargetStatus {
     bool listVerified = false;
     const Level* target = nullptr;
 };
-bool CaveBaseline(const LevelsTxt& row, int level, DWORD monsterCount);
+bool ArenaBaseline(const LevelsTxt& row, int level, DWORD monsterCount);
 bool TargetUnused(UnitAny* player, int target, TargetStatus* status = nullptr) {
     sgptDataTable* table = Tables();
     if (!(target == 20 || (target >= 13 && target <= 16) ||
@@ -2492,7 +2579,7 @@ bool TargetUnused(UnitAny* player, int target, TargetStatus* status = nullptr) {
     const LevelsTxt& row = table->pLevelsTxt[target];
     if (target == 20 ? row.wLevelNo != 20 :
         (!table->pMonStatsTxt || !table->dwMonStatsRecs ||
-         (!CaveBaseline(row, target, table->dwMonStatsRecs) &&
+         (!ArenaBaseline(row, target, table->dwMonStatsRecs) &&
           !(zoneGame && zoneRows == table->pLevelsTxt && zoneSlots[target].configured &&
             !memcmp(&row, &zoneSlots[target].configuredRow, sizeof(row))))))
         return false;
@@ -2697,6 +2784,16 @@ json InspectLevels(void* game, UnitAny* player, const Pending& request) {
     json levels = json::array();
     for (int cave = 13; cave <= 254; ++cave) {
         if (cave == 17) cave = 138;
+        if (cave == 15 && table && table->pLevelsTxt && table->pMonStatsTxt &&
+            table->dwMonStatsRecs && table->dwLevelsRecs > 15 &&
+            Readable(table->pLevelsTxt + 15, sizeof(LevelsTxt)) &&
+            !ArenaBaseline(table->pLevelsTxt[15], 15, table->dwMonStatsRecs)) {
+            levels.push_back({{"level", 15}, {"allocated", nullptr},
+                {"room2_generated", nullptr}, {"fresh", nullptr},
+                {"monster_region_allocated", nullptr}, {"consumed", nullptr},
+                {"verification_error", "arena_baseline_unverified"}});
+            continue;
+        }
         TargetStatus status;
         const bool fresh = TargetUnused(player, cave, &status) && !zoneSlots[cave].configured;
         if (!status.listVerified || !status.sourceFound)
@@ -2853,7 +2950,9 @@ json InspectLevels(void* game, UnitAny* player, const Pending& request) {
             {"cleared", source < 255 && runCleared[source]},
             {"population_ready", source < 255 && runPopulationReady[source]},
             {"encounter", source < 255 ? runEncounters[source] : 0},
-            {"starter_white_item_id", runStarterRewardId ?
+            {"encounter_warning", source < 255 && runEncounters[source] == kEncounterDegraded ?
+                runEncounterWarning : std::string{}},
+            {"starter_magic_item_id", runStarterRewardId ?
                 json(runStarterRewardId) : json(nullptr)},
             {"clear_reward_item_ids", source < 255 ?
                 json(runClearRewardIds[source]) : json(nullptr)},
@@ -2889,6 +2988,7 @@ json InspectLevels(void* game, UnitAny* player, const Pending& request) {
             {"natural_drop_failures", runDropFailureCount},
             {"last_natural_drop_error", runDropError},
             {"last_error", runError},
+            {"entry_banner_area", drawnEntryBannerArea.load(std::memory_order_acquire)},
             {"akara_permanent_cache_count", observedAkaraPerms},
             {"akara_potion_cache_count", observedAkaraPotions},
             {"akara_trade_matches_record", observedAkaraTrade},
@@ -2943,11 +3043,11 @@ static_assert(offsetof(LevelsTxt, wMonLvl) == 0x10 &&
     offsetof(LevelsTxt, wMon) == 0x36 &&
     offsetof(LevelsTxt, wNMon) == 0x68 &&
     offsetof(LevelsTxt, wUMon) == 0x9A, "S13 loaded level columns");
-bool CaveBaseline(const LevelsTxt& row, int level, DWORD monsterCount) {
+bool ArenaBaseline(const LevelsTxt& row, int level, DWORD monsterCount) {
     constexpr WORD sourceLevels[] = {2, 4, 5, 7};
     const WORD expected = level <= 16 ? sourceLevels[level - 13] : 2;
-    // S13 packs the normal and alternate monster counts into this legacy DWORD.
-    if (row.wLevelNo != level || row.nAct != 0 || row.wMonLvl[0] != expected ||
+    if (row.wLevelNo != level || row.nAct != 0 ||
+        row.wMonLvl[0] != expected ||
         row.wMonLvlEx[0] != expected || (row.dwNumMon & 0xff) != 3 ||
         (level >= 138 && (row.wMonLvlEx[1] != 37 || row.wMonLvlEx[2] != 78)))
         return false;
@@ -2958,9 +3058,9 @@ bool CaveBaseline(const LevelsTxt& row, int level, DWORD monsterCount) {
     return true;
 }
 // Pinned D2Common ordinal 10459 / RVA 2D2C0 is __stdcall DWORD(DWORD);
-// the stock numeric act thresholds classify every 138..254 as Act V, even
-// when authenticated Levels.txt says Act I. The portal constructor _exit's
-// on a cross-act pair, so this scoped detour must precede any high-ID portal.
+// Stock numeric thresholds classify every 138..254 as Act V regardless of the
+// loaded row. Keep portal routing in Act I even when Level 138 uses Act II data;
+// its constructor _exit's on a cross-act pair, so install this scoped detour first.
 using ActLookup = DWORD (__stdcall*)(DWORD);
 ActLookup originalActLookup = nullptr;
 bool actLookupInstalled = false;
@@ -2971,7 +3071,7 @@ DWORD __stdcall ScopedArenaAct(DWORD level) {
             table->pMonStatsTxt && table->dwMonStatsRecs &&
             Readable(table->pLevelsTxt + level, sizeof(LevelsTxt))) {
             const LevelsTxt& row = table->pLevelsTxt[level];
-            if (CaveBaseline(row, level, table->dwMonStatsRecs) ||
+            if (ArenaBaseline(row, level, table->dwMonStatsRecs) ||
                 (zoneRows == table->pLevelsTxt && zoneSlots[level].configured &&
                  !memcmp(&row, &zoneSlots[level].configuredRow, sizeof(row))))
                 return 0;
@@ -3022,7 +3122,7 @@ bool InstallArenaActLookup(std::string& error) {
         !Readable(table->pLvlDefs, 255 * 0x9C))
         { error = "expanded arena compiler rows unavailable"; return false; }
     for (int level = 138; level <= 254; ++level)
-        if (!CaveBaseline(table->pLevelsTxt[level], level, table->dwMonStatsRecs)) {
+        if (!ArenaBaseline(table->pLevelsTxt[level], level, table->dwMonStatsRecs)) {
             error = "expanded arena act profile differs at " + std::to_string(level); return false;
         }
     originalActLookup = reinterpret_cast<ActLookup>(const_cast<BYTE*>(entry));
@@ -3140,8 +3240,8 @@ bool ResetZoneRows(std::string& error, void* currentGame,
     mapMonsterSampleAfter = 0;
     return true;
 }
-// The game's compiled affix table is the catalog; no second copy of its 232
-// S13 map rows or property-functions is maintained by the roguelike.
+// S14 Patch #2's compiled affix table is authoritative; the roguelike keeps no
+// duplicate of its 232 map rows or property functions.
 std::array<RoguelikeAffixes::Candidate, 233> mapCatalog{};
 unsigned mapCatalogCount = 0;
 bool MapCatalog(std::string& error) {
@@ -3179,8 +3279,8 @@ bool MapCatalog(std::string& error) {
     if (count != 232 || prefixes != 118 || suffixes != 114) {
         error = "pinned stock map-affix catalog diverged"; return false;
     }
-    // Source S13 has an area-level property (374) but no enabled map-tier
-    // affix that rolls it. Make that zone-only property explicit.
+    // S14 ItemStatCost ID 374 is the area-level property, but no enabled S14
+    // map-tier affix rolls it. Add the property only to the zone catalog.
     mapCatalog[count++] = {kZoneAreaAffix, 0x10000, 0xF, 4, true, true};
     mapCatalogCount = count;
     return true;
@@ -3241,7 +3341,7 @@ bool ResolveMapRoll(void* game, UnitAny* player, unsigned depth,
     std::minstd_rand& random, RoguelikeAffixes::Roll& roll, std::string& error) {
     sgptDataTable* tables = Tables();
     D2MagicAffixDataTbl* affixes = D2COMMON_10492_DATATBLS_GetMagicAffixDataTables();
-    if (!game || !player || !tables || !S13ItemStatCostLayoutValid(tables) ||
+    if (!game || !player || !tables || !S14ItemStatCostLayoutValid(tables) ||
         !affixes || !affixes->pMagicAffixTxt || !player->pPath ||
         !player->pPath->pRoom1 || !player->pPath->pRoom1->Coll ||
         !createItem || !rollAffix) {
@@ -3455,11 +3555,11 @@ bool ApplyMapContext(void* game, const std::string& epoch, int area,
         error = "stock map target region baseline changed"; return false;
     }
     const BYTE* module = reinterpret_cast<const BYTE*>(GetModuleHandleA("ProjectDiablo.dll"));
-    const BYTE* entry = module ? module + 0x2dc520 : nullptr;
+    const BYTE* entry = module ? module + 0x38b540 : nullptr;
     const BYTE signature[] = {0x55,0x8b,0xec,0x83,0xec,0x4c,0x56,0x8b,0xf2,0x57,0x8b,0xf9};
     if (!entry || !Readable(entry, sizeof(signature)) ||
         memcmp(entry, signature, sizeof(signature))) {
-        error = "stock S13 map-world applicator changed"; return false;
+        error = "stock S14 map-world applicator changed"; return false;
     }
     MapContext previous;
     previous.monsters = *monsterCount;
@@ -3532,26 +3632,27 @@ bool ApplyMapContext(void* game, const std::string& epoch, int area,
 }
 // Stock MapPlayer uses these lazy imports for state 0xC6; verify their
 // IAT-backed wrappers before reusing the same lifecycle for a resistance-only list.
-bool ProjectDiabloImportThunk(const BYTE* module, DWORD functionRva, DWORD importRva) {
+bool ProjectDiabloImportThunk(const BYTE* module, DWORD functionRva, DWORD importRva, DWORD tableRva) {
     if (!module) return false;
     const BYTE* thunk = module + functionRva;
-    if (!Readable(thunk, 7) || !Readable(module + importRva, sizeof(DWORD)))
-        return false;
-    DWORD importSlot = 0;
+    if (!Readable(thunk, 22) || !Readable(module + importRva, sizeof(DWORD))) return false;
+    DWORD importSlot = 0, tableSlot = 0;
     memcpy(&importSlot, thunk + 2, sizeof(importSlot));
+    memcpy(&tableSlot, thunk + 18, sizeof(tableSlot));
     return thunk[0] == 0x83 && thunk[1] == 0x3d && thunk[6] == 0 &&
-        importSlot == reinterpret_cast<DWORD>(module + importRva);
+        thunk[15] == 0x8b && thunk[16] == 0x14 && thunk[17] == 0x85 &&
+        importSlot == reinterpret_cast<DWORD>(module + importRva) && tableSlot == reinterpret_cast<DWORD>(module + tableRva);
 }
 bool ZoneResistanceReleaseApiReady(const BYTE* module) {
-    return ProjectDiabloImportThunk(module, 0x2780a0, 0x4e83d8) &&
-        ProjectDiabloImportThunk(module, 0x277920, 0x4e7218) &&
-        Readable(module + 0x2778f0, 8);
+    return ProjectDiabloImportThunk(module, 0x30c540, 0x5eaa1c, 0x4a8b9c) &&
+        ProjectDiabloImportThunk(module, 0x30bdc0, 0x5eb93c, 0x49b2d0) &&
+        ProjectDiabloImportThunk(module, 0x30bd90, 0x5eabfc, 0x49b548);
 }
 bool ZoneResistanceStateApiReady(const BYTE* module) {
     return ZoneResistanceReleaseApiReady(module) &&
-        ProjectDiabloImportThunk(module, 0x278220, 0x4e8824) &&
-        ProjectDiabloImportThunk(module, 0x2783a0, 0x4e7a3c) &&
-        ProjectDiabloImportThunk(module, 0x27dd70, 0x4e7cc0);
+        ProjectDiabloImportThunk(module, 0x30c6c0, 0x5eaea4, 0x4a8704) &&
+        ProjectDiabloImportThunk(module, 0x30c840, 0x5ec1f0, 0x49b288) &&
+        ProjectDiabloImportThunk(module, 0x312360, 0x5ea2ac, 0x4a8964);
 }
 StatList* AllocateZoneResistanceState(void* game, UnitAny* player,
     const BYTE* module, std::string& error) {
@@ -3576,7 +3677,7 @@ StatList* AllocateZoneResistanceState(void* game, UnitAny* player,
     }
     using SetStateListId = void (__stdcall*)(StatList*, DWORD);
     reinterpret_cast<SetStateListId>(
-        const_cast<BYTE*>(module + 0x278220))(state, 0xc6);
+        const_cast<BYTE*>(module + 0x30c6c0))(state, 0xc6);
     return state;
 }
 bool SetZoneResistancePenalty(StatList* state, int penalty,
@@ -3613,15 +3714,15 @@ bool AttachZoneResistanceState(UnitAny* player, StatList* state,
     // Match the native order: register callback, attach, refresh, then activate.
     using SetStateListCallback = void (__stdcall*)(StatList*, void*);
     reinterpret_cast<SetStateListCallback>(
-        const_cast<BYTE*>(module + 0x2783a0))(
-            state, const_cast<BYTE*>(module + 0x27dd70));
+        const_cast<BYTE*>(module + 0x30c840))(
+            state, const_cast<BYTE*>(module + 0x312360));
     D2COMMON_AttachPropertyList(player, state, TRUE);
     using Refresh = void (__stdcall*)(UnitAny*);
     reinterpret_cast<Refresh>(
-        const_cast<BYTE*>(module + 0x2778f0))(player);
+        const_cast<BYTE*>(module + 0x30bd90))(player);
     using SetUnitState = void (__stdcall*)(UnitAny*, DWORD, BOOL);
     reinterpret_cast<SetUnitState>(
-        const_cast<BYTE*>(module + 0x277920))(player, 0xc6, TRUE);
+        const_cast<BYTE*>(module + 0x30bdc0))(player, 0xc6, TRUE);
     if (D2COMMON_GetStateStatList(player, 0xc6) != state ||
         !D2COMMON_GetUnitState(player, 0xc6)) {
         error = "native player resistance state did not activate";
@@ -3639,18 +3740,18 @@ bool ReleaseZoneResistanceState(UnitAny* player, StatList* state,
     using Refresh = void (__stdcall*)(UnitAny*);
     using SetUnitState = void (__stdcall*)(UnitAny*, DWORD, BOOL);
     reinterpret_cast<Release>(
-        const_cast<BYTE*>(module + 0x2780a0))(state);
+        const_cast<BYTE*>(module + 0x30c540))(state);
     reinterpret_cast<Refresh>(
-        const_cast<BYTE*>(module + 0x2778f0))(player);
+        const_cast<BYTE*>(module + 0x30bd90))(player);
     if (D2COMMON_GetStateStatList(player, 0xc6)) {
         error = "native player zone state survived cleanup";
         return false;
     }
     if (D2COMMON_GetUnitState(player, 0xc6)) {
         reinterpret_cast<SetUnitState>(
-            const_cast<BYTE*>(module + 0x277920))(player, 0xc6, FALSE);
+            const_cast<BYTE*>(module + 0x30bdc0))(player, 0xc6, FALSE);
         reinterpret_cast<Refresh>(
-            const_cast<BYTE*>(module + 0x2778f0))(player);
+            const_cast<BYTE*>(module + 0x30bd90))(player);
         if (D2COMMON_GetUnitState(player, 0xc6)) {
             error = "native player zone-state flag survived cleanup";
             return false;
@@ -3678,7 +3779,7 @@ bool PrepareZonePlayerState(void* game, UnitAny* player, bool hasMapAffixes,
             return false;
         }
     } else if (hasMapAffixes || penalty) {
-        const BYTE* refresh = module + 0x2778f0;
+        const BYTE* refresh = module + 0x30bd90;
         if (!Readable(refresh, 8)) {
             error = "stock player state refresh unavailable";
             return false;
@@ -3695,7 +3796,7 @@ bool ApplyExistingZoneResistancePenalty(UnitAny* player, StatList* state,
     if (!SetZoneResistancePenalty(state, penalty, error)) return false;
     using Refresh = void (__stdcall*)(UnitAny*);
     reinterpret_cast<Refresh>(
-        const_cast<BYTE*>(module + 0x2778f0))(player);
+        const_cast<BYTE*>(module + 0x30bd90))(player);
     return true;
 }
 bool NormalizeZonePlayerAffixes(UnitAny* player, StatList* state,
@@ -3798,7 +3899,7 @@ bool ApplyZonePlayer(void* game, UnitAny* player, int area, std::string& error) 
     if (mapPlayerCount) {
         mapPlayerBeforeMagicFind = D2COMMON_GetUnitStat(player, 80, 0);
         if (!state) {
-            const BYTE* entry = module + 0x2dba50;
+            const BYTE* entry = module + 0x38aa70;
             const BYTE signature[] = {0x55,0x8b,0xec,0x6a,0xff};
             if (!Readable(entry, sizeof(signature)) ||
                 memcmp(entry, signature, sizeof(signature))) {
@@ -3874,7 +3975,7 @@ json ConfigureZone(void* game, UnitAny* player, const Pending& request) {
         !table->pMonStatsTxt || !table->dwMonStatsRecs || table->dwMonStatsRecs > 32768 ||
         !Readable(table->pMonStatsTxt, size_t(table->dwMonStatsRecs) * sizeof(MonStatsTxt)) ||
         static_cast<DWORD>(zone.classId) >= table->dwMonStatsRecs)
-        return Failure("unrecognized loaded S13 level or monster table");
+        return Failure("unrecognized loaded S14 level or monster table");
     const MonStatsTxt& monster = table->pMonStatsTxt[zone.classId];
     const bool ordinary = zone.kind == Pending::ZoneKind::Monster;
     const bool boss = BossZone(zone.kind);
@@ -3931,7 +4032,7 @@ json ConfigureZone(void* game, UnitAny* player, const Pending& request) {
     ZoneSlot& slot = zoneSlots[zone.level];
     if (slot.configured) return Failure("cave already configured for this game");
     LevelsTxt& row = zoneRows[zone.level];
-    if (!CaveBaseline(row, zone.level, table->dwMonStatsRecs))
+    if (!ArenaBaseline(row, zone.level, table->dwMonStatsRecs))
         return {{"ok", false}, {"code", "malformed_level_table"},
             {"request_id", request.id}, {"to_level", zone.level},
             {"row_level", row.wLevelNo}, {"normal_level", row.wMonLvl[0]},
@@ -3973,6 +4074,8 @@ json ConfigureZone(void* game, UnitAny* player, const Pending& request) {
             replacement.wUMon[index] = classId;
         }
     }
+    if (zone.depth > 0 && wcscmp(row.wszLevelName, L"The Abyss") == 0)
+        swprintf_s(replacement.wszLevelName, L"The Abyss - Level %d", zone.depth);
     slot.original = row;
     if (!UpdateLevelRow(row, replacement)) {
         UpdateLevelRow(row, slot.original);
@@ -4013,7 +4116,7 @@ json ConfigureZone(void* game, UnitAny* player, const Pending& request) {
     slot.testOnly = zone.testOnly;
     slot.affixes = mapAffixes;
     slot.kind = zone.kind;
-    slot.regionDensity = baselineDensity;
+    slot.regionDensity = *reinterpret_cast<const DWORD*>(region + 0x2B8);
     slot.otherShrine = zone.otherShrine;
     slot.secondOtherShrine = zone.secondOtherShrine;
     slot.bossSuperuniqueId = zone.bossSuperuniqueId;
@@ -4042,9 +4145,8 @@ json ConfigureZone(void* game, UnitAny* player, const Pending& request) {
         {"reward_focus", static_cast<int>(zone.reward)},
         {"zone_affixes", zone.depth ? ZoneAffixReceipt(zone.affixes) : json(nullptr)}};
 }
-bool RunTileFree(Room1* room, const CollMap* map, int x, int y) {
+bool RunTileClearance(const CollMap* map, int x, int y) {
     if (x < 1 || y < 1 || x >= UINT16_MAX || y >= UINT16_MAX) return false;
-    // Keep live actors, objects and ground drops clear of NPC/portal tiles.
     for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) {
         const int64_t mx = int64_t(x) + ox - map->dwPosGameX;
         const int64_t my = int64_t(y) + oy - map->dwPosGameY;
@@ -4052,6 +4154,10 @@ bool RunTileFree(Room1* room, const CollMap* map, int x, int y) {
             (map->pMapStart[size_t(my) * map->dwSizeGameX + size_t(mx)] & 0x3E01))
             return false;
     }
+    return true;
+}
+template<typename Visitor>
+bool VisitRunOccupants(Room1* room, Visitor visit) {
     UnitAny* unit = room->pUnitFirst;
     unsigned visited = 0;
     for (; unit && visited < 4096; unit = unit->pRoomNext, ++visited) {
@@ -4070,9 +4176,32 @@ bool RunTileFree(Room1* room, const CollMap* map, int x, int y) {
             if (!Readable(unit->pPath, sizeof(Path))) return false;
             ux = unit->pPath->xPos; uy = unit->pPath->yPos;
         }
-        if (std::abs(x - ux) <= 2 && std::abs(y - uy) <= 2) return false;
+        if (!visit(ux, uy)) return false;
     }
     return visited < 4096;
+}
+bool RunTileFree(Room1* room, const CollMap* map, int x, int y) {
+    return RunTileClearance(map, x, y) && VisitRunOccupants(room, [=](int ux, int uy) {
+        return std::abs(x - ux) > 2 || std::abs(y - uy) > 2;
+    });
+}
+// Plan against one game-thread snapshot, not one native unit walk per tile.
+// Construction still rechecks occupancy using RunTileFree at the chosen sites.
+bool MarkRunOccupancy(Room1* room, const CollMap* map, std::vector<BYTE>& occupied) {
+    return VisitRunOccupants(room, [&](int x, int y) {
+        const int64_t mx = int64_t(x) - map->dwPosGameX;
+        const int64_t my = int64_t(y) - map->dwPosGameY;
+        for (int dy = -2; dy <= 2; ++dy) for (int dx = -2; dx <= 2; ++dx) {
+            if (mx + dx >= 0 && my + dy >= 0 && mx + dx < map->dwSizeGameX &&
+                    my + dy < map->dwSizeGameY)
+                occupied[size_t(my + dy) * map->dwSizeGameX + size_t(mx + dx)] = 1;
+        }
+        return true;
+    });
+}
+bool RunCandidateFree(const CollMap* map, const std::vector<BYTE>& occupied, int x, int y) {
+    return RunTileClearance(map, x, y) &&
+        !occupied[size_t(y - map->dwPosGameY) * map->dwSizeGameX + size_t(x - map->dwPosGameX)];
 }
 bool FindPortalTile(Room1* room, UnitAny* player, int& x, int& y) {
     if (!Readable(room->Coll, sizeof(CollMap))) return false;
@@ -4169,13 +4298,13 @@ bool RunLayoutAccessible(const CollMap* map, const RunTile& entry,
         if (!approach(portal)) return false;
     return true;
 }
-bool ChestTileHasApproachSpace(Room1* room, const CollMap* map,
-    const RunTile& tile) {
+bool ChestTileHasApproachSpace(const CollMap* map,
+    const std::vector<BYTE>& occupied, const RunTile& tile) {
     unsigned openApproaches = 0;
     for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx) {
             if (!dx && !dy) continue;
-            if (RunTileFree(room, map, tile.x + dx, tile.y + dy) &&
+            if (RunCandidateFree(map, occupied, tile.x + dx, tile.y + dy) &&
                 ++openApproaches >= 4)
                 return true;
         }
@@ -4183,27 +4312,29 @@ bool ChestTileHasApproachSpace(Room1* room, const CollMap* map,
 }
 // One collision component and one plan for the whole event, rather than
 // placing each sprite at the first free tile three steps from the player.
-bool PlanRunLayout(Room1* room, UnitAny* player, unsigned actorCount,
-    RunLayout& layout, bool safeChestActors = false) {
-    if (!player || !player->pPath || !room ||
-        !Readable(room->Coll, sizeof(CollMap)) || actorCount > layout.actors.size())
-        return false;
+bool PlanRunLayoutFrom(Room1* room, const RunTile& entry, unsigned actorCount,
+    RunLayout& layout, bool safeChestActors) {
+    if (!room || !Readable(room->Coll, sizeof(CollMap)) ||
+        actorCount > layout.actors.size()) return false;
+    layout = {};
     const CollMap* map = room->Coll;
     const uint64_t cells = uint64_t(map->dwSizeGameX) * map->dwSizeGameY;
     if (!cells || cells > 65536 ||
         !Readable(map->pMapStart, size_t(cells) * sizeof(WORD))) return false;
-    const RunTile entry{player->pPath->xPos, player->pPath->yPos};
+    layout.portalRoom = room;
     std::vector<BYTE> reachable(size_t(cells), 0);
     std::vector<size_t> queue;
     queue.reserve(size_t(cells));
     if (!WalkRunFloor(map, entry, nullptr, reachable, queue)) return false;
+    std::vector<BYTE> occupied(size_t(cells), 0);
+    if (!MarkRunOccupancy(room, map, occupied)) return false;
     std::vector<RunTile> candidates;
     candidates.reserve(queue.size());
     int minX = INT_MAX, minY = INT_MAX, maxX = 0, maxY = 0;
     for (const size_t cell : queue) {
         const int x = map->dwPosGameX + int(cell % map->dwSizeGameX);
         const int y = map->dwPosGameY + int(cell / map->dwSizeGameX);
-        if (!RunTileFree(room, map, x, y)) continue;
+        if (!RunCandidateFree(map, occupied, x, y)) continue;
         candidates.push_back({x, y});
         minX = (std::min)(minX, x); maxX = (std::max)(maxX, x);
         minY = (std::min)(minY, y); maxY = (std::max)(maxY, y);
@@ -4233,7 +4364,7 @@ bool PlanRunLayout(Room1* room, UnitAny* player, unsigned actorCount,
             if (!portal && safeChestActors &&
                 (!RoguelikeLoot::InsideRoomMargin(
                     tile.x, tile.y, minX, minY, maxX, maxY, 3) ||
-                 !ChestTileHasApproachSpace(room, map, tile)))
+                 !ChestTileHasApproachSpace(map, occupied, tile)))
                 continue;
             bool clear = true;
             for (unsigned i = 0; i < layout.actorCount; ++i) {
@@ -4260,6 +4391,152 @@ bool PlanRunLayout(Room1* room, UnitAny* player, unsigned actorCount,
     for (unsigned i = 0; i < actorCount; ++i)
         if (!choose(i, actorCount, false, layout.actors[i])) return false;
     return RunLayoutAccessible(map, entry, layout, reachable, queue);
+}
+bool PlanRunLayout(Room1* room, UnitAny* player, unsigned actorCount,
+    RunLayout& layout, bool safeChestActors = false) {
+    return player && player->pPath && PlanRunLayoutFrom(room,
+        {player->pPath->xPos, player->pPath->yPos}, actorCount, layout, safeChestActors);
+}
+
+// Only materialize a collision view when the normal current-room plan cannot fit.
+// Room borders may meet in world coordinates without an engine connection.
+struct ChoiceFloor {
+    struct Room { Room1* room; const CollMap* map; };
+    std::vector<Room> rooms;
+    std::vector<uint16_t> owners;
+    int x = 0, y = 0, width = 0, height = 0;
+    size_t Index(int px, int py) const {
+        return size_t(py - y) * width + size_t(px - x);
+    }
+    RunTile Tile(size_t at) const {
+        return {x + int(at % width), y + int(at / width)};
+    }
+    bool Contains(int px, int py) const {
+        return px >= x && py >= y && px - x < width && py - y < height;
+    }
+};
+
+bool BuildChoiceFloor(Level* level, const RunTile& entry, ChoiceFloor& floor) {
+    constexpr unsigned roomLimit = 256;
+    constexpr uint64_t cellLimit = 262144;
+    int x0 = UINT16_MAX, y0 = UINT16_MAX, x1 = 0, y1 = 0;
+    unsigned visited = 0;
+    for (Room2* metadata = level->pRoom2First; metadata; metadata = metadata->pRoom2Next) {
+        if (++visited > roomLimit || !Readable(metadata, sizeof(Room2)) ||
+            metadata->pLevel != level) return false;
+        Room1* room = metadata->pRoom1;
+        if (!room) continue;
+        if (!Readable(room, sizeof(Room1)) || room->pRoom2 != metadata ||
+            !Readable(room->Coll, sizeof(CollMap))) return false;
+        const CollMap* m = room->Coll;
+        const uint64_t right = uint64_t(m->dwPosGameX) + m->dwSizeGameX;
+        const uint64_t bottom = uint64_t(m->dwPosGameY) + m->dwSizeGameY;
+        const uint64_t count = uint64_t(m->dwSizeGameX) * m->dwSizeGameY;
+        if (right > UINT16_MAX || bottom > UINT16_MAX || !count || count > 65536 ||
+            !Readable(m->pMapStart, size_t(count) * sizeof(WORD))) return false;
+        x0 = (std::min)(x0, int(m->dwPosGameX)); y0 = (std::min)(y0, int(m->dwPosGameY));
+        x1 = (std::max)(x1, int(right)); y1 = (std::max)(y1, int(bottom));
+        floor.rooms.push_back({room, m});
+    }
+    if (floor.rooms.empty() || uint64_t(x1 - x0) * (y1 - y0) > cellLimit) return false;
+    floor.x = x0; floor.y = y0; floor.width = x1 - x0; floor.height = y1 - y0;
+    floor.owners.resize(size_t(floor.width) * floor.height);
+    for (size_t i = 0; i < floor.rooms.size(); ++i) {
+        const CollMap* m = floor.rooms[i].map;
+        for (DWORD dy = 0; dy < m->dwSizeGameY; ++dy) for (DWORD dx = 0; dx < m->dwSizeGameX; ++dx) {
+            const int x = int(m->dwPosGameX + dx), y = int(m->dwPosGameY + dy);
+            uint16_t& owner = floor.owners[floor.Index(x, y)];
+            // Overlapping collision snapshots are ambiguous; don't stitch through them.
+            if (owner) owner = UINT16_MAX;
+            else owner = RunFloorOpen(m, x, y, entry) ? uint16_t(i + 1) : UINT16_MAX;
+        }
+    }
+    return floor.Contains(entry.x, entry.y);
+}
+
+bool ChoiceRoomsConnected(const Room1* from, const Room1* to) {
+    return from->dwRoomsNear && from->dwRoomsNear <= 256 &&
+        Readable(from->pRoomsNear, size_t(from->dwRoomsNear) * sizeof(Room1*)) &&
+        std::find(from->pRoomsNear, from->pRoomsNear + from->dwRoomsNear, to) !=
+            from->pRoomsNear + from->dwRoomsNear;
+}
+
+void WalkChoiceFloor(const ChoiceFloor& floor, const RunTile& entry,
+    const RunLayout* layout, std::vector<BYTE>& visited, std::vector<size_t>& queue) {
+    const auto blocked = [&](const RunTile& tile) {
+        return layout && std::any_of(layout->portals.begin(), layout->portals.end(),
+            [&](const RunTile& portal) { return RunTileDistance(tile, portal) <= 1; });
+    };
+    const size_t start = floor.Index(entry.x, entry.y);
+    if (!floor.owners[start] || floor.owners[start] == UINT16_MAX || blocked(entry)) return;
+    visited[start] = 1;
+    queue.push_back(start);
+    for (size_t head = 0; head < queue.size(); ++head) {
+        const size_t cell = queue[head];
+        const RunTile here = floor.Tile(cell);
+        const uint16_t from = floor.owners[cell];
+        for (const RunTile delta : {RunTile{1,0}, RunTile{-1,0}, RunTile{0,1}, RunTile{0,-1}}) {
+            const RunTile next{here.x + delta.x, here.y + delta.y};
+            if (!floor.Contains(next.x, next.y)) continue;
+            const size_t at = floor.Index(next.x, next.y);
+            const uint16_t to = floor.owners[at];
+            if (!to || to == UINT16_MAX || visited[at] || blocked(next)) continue;
+            if (from != to && !ChoiceRoomsConnected(
+                    floor.rooms[from - 1].room, floor.rooms[to - 1].room)) continue;
+            visited[at] = 1;
+            queue.push_back(at);
+        }
+    }
+}
+
+bool ChoicePortalsAccessible(const ChoiceFloor& floor, const RunTile& entry,
+    const RunLayout& layout, std::vector<BYTE>& visited, std::vector<size_t>& queue) {
+    std::fill(visited.begin(), visited.end(), 0);
+    queue.clear();
+    WalkChoiceFloor(floor, entry, &layout, visited, queue);
+    for (const RunTile& portal : layout.portals) {
+        bool reachable = false;
+        for (int dy = -2; dy <= 2; ++dy) for (int dx = -2; dx <= 2; ++dx) {
+            const int x = portal.x + dx, y = portal.y + dy;
+            if (floor.Contains(x, y) && visited[floor.Index(x, y)]) reachable = true;
+        }
+        if (!reachable) return false;
+    }
+    return true;
+}
+
+unsigned PlanClearChoices(Room1* current, UnitAny* player, RunLayout& layout) {
+    if (PlanRunLayout(current, player, 0, layout)) return 3;
+    if (!player || !player->pPath || !Readable(current, sizeof(Room1)) ||
+        !Readable(current->pRoom2, sizeof(Room2)) ||
+        !Readable(current->pRoom2->pLevel, sizeof(Level))) return false;
+    const RunTile entry{player->pPath->xPos, player->pPath->yPos};
+    ChoiceFloor floor;
+    if (!BuildChoiceFloor(current->pRoom2->pLevel, entry, floor)) return false;
+    std::vector<BYTE> visited(floor.owners.size()), check(floor.owners.size());
+    std::vector<size_t> cells, checked;
+    WalkChoiceFloor(floor, entry, nullptr, visited, cells);
+    std::vector<BYTE> tried(floor.rooms.size());
+    for (size_t cell : cells) {
+        const size_t index = floor.owners[cell] - 1;
+        const auto& room = floor.rooms[index];
+        if (room.room == current || tried[index]) continue;
+        tried[index] = 1;
+        if (PlanRunLayoutFrom(room.room, floor.Tile(cell), 0, layout, false) &&
+            ChoicePortalsAccessible(floor, entry, layout, check, checked)) return 3;
+    }
+    // A connected path reaches within two tiles before entering the portal footprint.
+    for (size_t cell : cells) {
+        const auto& room = floor.rooms[floor.owners[cell] - 1];
+        const RunTile tile = floor.Tile(cell);
+        if (RunTileDistance(entry, tile) <= 2 ||
+            !RunTileFree(room.room, room.map, tile.x, tile.y)) continue;
+        layout = {};
+        layout.portalRoom = room.room;
+        layout.portals[0] = tile;
+        return 1;
+    }
+    return 0;
 }
 json CreatePortal(void* game, UnitAny* player, const Pending& request) {
     const int from = request.portalJob->first;
@@ -4404,8 +4681,19 @@ bool CopyZoneAffixLabel(unsigned id, wchar_t (&name)[32]) {
     name[written] = L'\0';
     return true;
 }
+std::uint64_t AuthoredMapTiles(const sgptDataTable& table, int target) {
+    if (!table.pLvlDefs || target <= 0 || static_cast<DWORD>(target) >= table.dwLevelsRecs)
+        return 0;
+    const BYTE* levelDef = table.pLvlDefs + size_t(target) * 0x9C;
+    if (!Readable(levelDef, 0x9C)) return 0;
+    // Normal difficulty dimensions from the compiled LevelDef, not LevelsTxt.
+    DWORD width = 0, height = 0;
+    memcpy(&width, levelDef + 0x0C, sizeof(width));
+    memcpy(&height, levelDef + 0x18, sizeof(height));
+    return std::uint64_t(width) * height;
+}
 bool FormatChoiceName(wchar_t (&text)[2048], const wchar_t* monsterName,
-    const Pending::Zone& zone, bool townEntry) {
+    const Pending::Zone& zone, bool townEntry, const sgptDataTable& table, int target) {
     const wchar_t* displayName = monsterName;
     wchar_t prefixName[32]{}, suffixName[32]{};
     bool hasPrefix = false, hasSuffix = false;
@@ -4460,6 +4748,7 @@ bool FormatChoiceName(wchar_t (&text)[2048], const wchar_t* monsterName,
         request.kind = RoguelikePortalLabels::Kind::Boss;
     } else {
         request.kind = RoguelikePortalLabels::Kind::Monster;
+        request.mapTiles = AuthoredMapTiles(table, target);
     }
     request.quality = zone.affixes.quality;
     request.monsterName = displayName;
@@ -4594,7 +4883,7 @@ bool IsRunOwnedTrigger(void* game, const Pending& request,
 }
 
 json CreateTrigger(void* game, UnitAny* player, const Pending& request,
-    const RunTile* planned = nullptr) {
+    const RunTile* planned = nullptr, Room1* plannedRoom = nullptr) {
     if (!ObservationTelemetry::MatchesContext(request.expectedEpoch, game, player) ||
         !player || player->dwUnitId != request.playerId ||
         !player->pPath || !player->pPath->pRoom1 || !player->pPath->pRoom1->pRoom2 ||
@@ -4630,10 +4919,20 @@ json CreateTrigger(void* game, UnitAny* player, const Pending& request,
         return Failure("choice monster name unavailable");
     Room1* room = D2COMMON_GetRoomFromUnit(player);
     if (!room || !room->Coll) return Failure("source room unavailable");
+    if (plannedRoom && plannedRoom != room) {
+        if (!planned || !Readable(plannedRoom, sizeof(Room1)) ||
+            !Readable(plannedRoom->pRoom2, sizeof(Room2)) ||
+            plannedRoom->pRoom2->pRoom1 != plannedRoom ||
+            plannedRoom->pRoom2->pLevel != room->pRoom2->pLevel ||
+            !Readable(plannedRoom->Coll, sizeof(CollMap)))
+            return Failure("planned choice room changed");
+        room = plannedRoom;
+    }
     int x, y;
     if (planned) {
         if (!RunTileFree(room, room->Coll, planned->x, planned->y))
-            return Failure("planned choice tile obstructed");
+            return {{"ok", false}, {"status", "tile_obstructed"},
+                {"error", "planned choice tile obstructed"}};
         x = planned->x; y = planned->y;
     } else if (!FindPortalTile(room, player, x, y))
         return Failure("no safe unoccupied trigger tile");
@@ -4641,11 +4940,10 @@ json CreateTrigger(void* game, UnitAny* player, const Pending& request,
     if (request.resumeRun && request.resumeSnapshot) {
         RoguelikePortalLabels::Request resumeLabel;
         resumeLabel.kind = RoguelikePortalLabels::Kind::Resume;
-        resumeLabel.activeLevel = request.resumeSnapshot->value("active_level", 20);
         if (!RoguelikePortalLabels::Format(resumeLabel, name.text, 2048))
             return Failure("resume label could not be rendered");
     } else if (!FormatChoiceName(name.text, monsterName, roll,
-            request.townEntry)) {
+            request.townEntry, *table, *request.triggerJob)) {
         return Failure("choice label could not be rendered");
     }
     UnitAny* trigger = nullptr;
@@ -4938,6 +5236,24 @@ json WarpToFreshLevel(void* game, UnitAny* player, int level) {
     return {{"ok", accepted != 0}, {"status", accepted ? "transition_requested" : "transfer_rejected"},
         {"destination_level", level}, {"x", x}, {"y", y}};
 }
+// Room generation can place nests, but the supplemental constructor cannot.
+// Preserve natural spawners and use their data-defined offspring for pack fill.
+int SupplementalMonsterClass(int classId) {
+    const sgptDataTable* table = Tables();
+    if (!table || !table->pMonStatsTxt || classId < 0 ||
+        static_cast<DWORD>(classId) >= table->dwMonStatsRecs ||
+        !Readable(table->pMonStatsTxt + classId, sizeof(MonStatsTxt))) return -1;
+    const MonStatsTxt& row = table->pMonStatsTxt[classId];
+    if (!row.dwFlags.bPlaceSpawn) return classId;
+    const WORD child = row.wSpawn;
+    if (child >= table->dwMonStatsRecs ||
+        !Readable(table->pMonStatsTxt + child, sizeof(MonStatsTxt))) return -1;
+    const MonStatsTxt& offspring = table->pMonStatsTxt[child];
+    return offspring.dwFlags.bEnabled && offspring.dwFlags.bKillable &&
+        !offspring.dwFlags.bNPC && !offspring.dwFlags.binTown &&
+        !offspring.dwFlags.bPlaceSpawn && offspring.bAlign == 0 ? child : -1;
+}
+
 // Called only after the one-room generator has returned; its census is not
 // evidence of natural completion while the destination transition is queued.
 json EnsureArenaEncounter(void* game, UnitAny* player, int level,
@@ -4971,13 +5287,18 @@ json EnsureArenaEncounter(void* game, UnitAny* player, int level,
     if (!toSpawn)
         return {{"ok", true}, {"status", "natural_population"},
             {"living_hostiles", livingHostiles}};
+    std::array<int, 4> seedClasses{};
+    for (unsigned i = 0; i < monsterClassCount; ++i) {
+        seedClasses[i] = SupplementalMonsterClass(monsterClasses[i]);
+        if (seedClasses[i] < 0) return Failure("arena pack has no valid supplemental monster class");
+    }
     ServerMonsters::Request seed;
     seed.operation = ServerMonsters::Operation::Spawn;
     seed.encounterLevel = monsterLevel;
-    seed.enemies.push_back(ServerMonsters::Enemy{monsterClasses[0], -1,
+    seed.enemies.push_back(ServerMonsters::Enemy{seedClasses[0], -1,
         ServerMonsters::Rank::Normal, 1});
     for (unsigned i = 0; i < toSpawn; ++i) {
-        seed.enemies[0].classId = monsterClasses[i % monsterClassCount];
+        seed.enemies[0].classId = seedClasses[i % monsterClassCount];
         const json result = ServerMonsters::Execute(game, player, seed);
         if (!result.value("ok", false) ||
             result.value("spawned_count", 0) != 1 ||
@@ -4998,6 +5319,22 @@ json EnsureArenaEncounter(void* game, UnitAny* player, int level, int classId,
     return EnsureArenaEncounter(game, player, level, monsterClasses, 1,
         monsterLevel, requiredHostiles);
 }
+// Never retry a partially executed spawn. Settle the actual room instead, even
+// if it is already empty and will not produce a kill callback.
+json DegradeEncounter(int level, json result) {
+    if (!runError.empty()) {
+        runEncounters[level] = 3;
+        return result; // Keep integrity errors terminal.
+    }
+    runEncounterWarning = result.value("error",
+        result.value("status", std::string("encounter setup failed")));
+    if (result.contains("detail"))
+        runEncounterWarning += ": " + result["detail"].value("error", std::string{});
+    runEncounters[level] = kEncounterDegraded;
+    runClearRetry.store(true, std::memory_order_release);
+    return result;
+}
+
 json CompleteStarterEncounter(void* game, UnitAny* player) {
     if (runCleared[20] || !runPopulationReady[20] ||
         !PortalArea(player, 20) || runEncounters[20])
@@ -5014,10 +5351,8 @@ json CompleteStarterEncounter(void* game, UnitAny* player) {
     // Keep the authored one-Zombie intro; generated arenas use the pack default.
     json result = EnsureArenaEncounter(game, player, 20,
         table->pLevelsTxt[20].wMon[0], table->pLevelsTxt[20].wMonLvl[0], 1);
-    runEncounters[20] = result.value("ok", false) ?
-        (result.value("status", "") == "natural_population" ? 1 : 2) : 3;
-    if (runEncounters[20] == 3)
-        runError = "first-zone population could not be certified";
+    if (!result.value("ok", false)) return DegradeEncounter(20, std::move(result));
+    runEncounters[20] = result.value("status", "") == "natural_population" ? 1 : 2;
     return result;
 }
 unsigned ExtraBossCount(const RoguelikeAffixes::Roll& roll) {
@@ -5112,9 +5447,11 @@ json CompleteNonCombatZone(void* game, UnitAny* player, int level,
     if (actorCount && !PlanRunLayout(
             D2COMMON_GetRoomFromUnit(player), player, actorCount, layout,
             zone.kind == Pending::ZoneKind::Chest)) {
-        runEncounters[level] = 3;
-        runError = "no spacious, reachable event and choice layout";
-        return Failure(runError);
+        runEncounters[level] = kEncounterDegraded;
+        runEncounterWarning = "no spacious, reachable event and choice layout";
+        runCleared[level] = true; // No event object was created; the census already proved empty.
+        if (!zone.testOnly) ServerSpawns::OfferChoices(game, level);
+        return {{"ok", true}, {"status", "event_layout_skipped"}};
     }
     json event;
     if (zone.kind == Pending::ZoneKind::Merchant) {
@@ -5225,27 +5562,21 @@ json CompleteArenaEncounter(void* game, UnitAny* player, int level) {
         return CompleteNonCombatZone(game, player, level, zone);
     if (BossZone(zone.kind)) {
         json boss = SpawnBossEncounter(game, player, level, zone);
-        runEncounters[level] = boss.value("ok", false) ? 2 : 3;
-        if (runEncounters[level] == 3) {
-            runError = boss.value("error", "boss encounter could not be certified");
-            if (boss.contains("detail")) runError += ": " + boss["detail"].dump();
-        }
+        if (!boss.value("ok", false)) return DegradeEncounter(level, std::move(boss));
+        runEncounters[level] = 2;
         return boss;
     }
     json result = EnsureArenaEncounter(game, player, level,
         zone.selectedMonsterClasses, zone.selectedMonsterClassCount,
         zone.configuredRow.wMonLvl[0]);
-    if (!result.value("ok", false)) {
-        runEncounters[level] = 3;
-        runError = "native room finished but combat encounter could not be certified";
-        return result;
-    }
+    if (!result.value("ok", false)) return DegradeEncounter(level, std::move(result));
     const unsigned extra = ExtraBossCount(zone.affixes);
     if (extra) {
-        if (extra != 1) {
-            runEncounters[level] = 3;
-            runError = "stock Duplicated boss magnitude changed"; return Failure(runError);
-        }
+        if (extra != 1)
+            return DegradeEncounter(level, Failure("stock Duplicated boss magnitude changed"));
+        const int extraClass = SupplementalMonsterClass(zone.selectedClassId);
+        if (extraClass < 0)
+            return DegradeEncounter(level, Failure("stock Duplicated affix has no valid supplemental monster class"));
         // S13's enabled 498/category-2005 map affix has no world switch
         // consumer. Reuse the verified native unique rank/spawn path once
         // after natural population, so this boss joins the same clear census.
@@ -5253,16 +5584,15 @@ json CompleteArenaEncounter(void* game, UnitAny* player, int level) {
         boss.operation = ServerMonsters::Operation::Spawn;
         boss.encounterLevel = zone.configuredRow.wMonLvl[0];
         boss.enemies.push_back(ServerMonsters::Enemy{
-            zone.selectedClassId, -1, ServerMonsters::Rank::Unique, 1});
+            extraClass, -1, ServerMonsters::Rank::Unique, 1});
         json spawned = ServerMonsters::Execute(game, player, boss);
         if (!spawned.value("ok", false) || spawned.value("spawned_count", 0) != 1 ||
             !spawned.value("group_observation_complete", false) ||
             !spawned.contains("enemies") || spawned["enemies"].size() != 1 ||
             !spawned["enemies"][0].contains("id") ||
             !spawned["enemies"][0]["id"].is_number_unsigned() || !runError.empty()) {
-            runEncounters[level] = 3;
-            runError = "stock Duplicated unique boss could not be certified";
-            return {{"ok", false}, {"status", "extra_boss_failed"}, {"detail", spawned}};
+            return DegradeEncounter(level,
+                {{"ok", false}, {"status", "extra_boss_failed"}, {"detail", std::move(spawned)}});
         }
         runBossUnit[level] = spawned["enemies"][0]["id"].get<DWORD>();
         result["extra_boss"] = spawned["enemies"][0];
@@ -6196,9 +6526,9 @@ json ArmRun(void* game, UnitAny* player, const Pending& request) {
         return Failure("run object or labels unavailable: " + error);
     const BYTE* mod = reinterpret_cast<const BYTE*>(GetModuleHandleA("ProjectDiablo.dll"));
     const BYTE mapSignature[] = {0x55,0x8b,0xec,0x6a,0xff};
-    if (!mod || !Readable(mod + 0x2dba50, sizeof(mapSignature)) ||
-        memcmp(mod + 0x2dba50, mapSignature, sizeof(mapSignature)) ||
-        !Readable(mod + 0x2778f0, 8))
+    if (!mod || !Readable(mod + 0x38aa70, sizeof(mapSignature)) ||
+        memcmp(mod + 0x38aa70, mapSignature, sizeof(mapSignature)) ||
+        !ZoneResistanceReleaseApiReady(mod))
         return Failure("unrecognized native map-monster bindings");
     if (!ServerMonsters::PrepareRoomClear(error))
         return Failure("room-clear bindings unavailable: " + error);
@@ -6232,6 +6562,7 @@ json ArmRun(void* game, UnitAny* player, const Pending& request) {
     runStarterSettled.store(false, std::memory_order_release);
     runBossKillWitness.store(false, std::memory_order_release);
     runClearRetry.store(false, std::memory_order_release);
+    runChoicePlacementPending.store(false, std::memory_order_release);
     runArrivalLevel = 0;
     runKillLootLedger.fill(0);
     runKillLootLedgerLevel = 0;
@@ -6855,6 +7186,7 @@ bool BuildFreshRunRootZone(int target, unsigned seed,
 json StartTownRun(void* game, UnitAny* player) {
     if (!PortalArea(player, 1) || runGame.load(std::memory_order_acquire))
         return Failure("start a fresh run in Rogue Encampment");
+    autoEntrance.store(AutoEntrance::Handled, std::memory_order_release);
     std::string error;
     if (!CharacterState::RestoreLevelOneLife(game, player, error))
         return Failure("fresh run life restoration failed: " + error);
@@ -7154,8 +7486,8 @@ void ReportStart(void* game, UnitAny* player, const json& result) {
     std::string text = !result.value("ok", false) ?
         "Run start failed: " + result.value("error", std::string("entrance unavailable")) :
         result.value("resume_available", false) ?
-        "Saved run ready. Click the Resume Run portal." :
-        "Roguelike entrance opened. Click the Begin descent portal.";
+        "Saved run ready. Click the Return to the Abyss portal." :
+        "Roguelike entrance opened. Click the Enter the Abyss portal.";
     if (text.size() > 120) text.resize(120);
     BYTE message[128] = {0x15, 1, 0};
     memcpy(message + 3, text.data(), text.size());
@@ -7175,8 +7507,10 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
             (chest->dwMode != OBJ_MODE_IDLE &&
              chest->dwMode != OBJ_MODE_OPERATING &&
              chest->dwMode != OBJ_MODE_OPENED)) {
-            runError = "owned locked chest identity or state changed";
-            return;
+            runChestSettled[level][index] = true; // Never operate an unauthenticated chest.
+            ++runDropFailureCount;
+            runDropError = "owned locked chest identity or state changed";
+            continue;
         }
         if (chest->dwMode != OBJ_MODE_OPENED) {
             // Initialization clears the constructor's lock; restore it only
@@ -7196,18 +7530,21 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
                 zoneSlots[level].depth, zoneSlots[level].testOnly));
         const int playerLevel = MarketCharacterLevel();
         if (playerLevel < 1 || playerLevel > 99) {
-            runError = "chest unique reward has no valid character level";
-            return;
+            ++runDropFailureCount;
+            runDropError = "chest unique reward has no valid character level";
+            continue;
         }
         if (runChestUniqueCounts[level] > runChestUniqueIds[level].size()) {
-            runError = "chest unique exclusion history is invalid";
-            return;
+            ++runDropFailureCount;
+            runDropError = "chest unique exclusion history is invalid";
+            continue;
         }
         unsigned& uniqueCount = runChestUniqueCounts[level];
         auto& uniqueIds = runChestUniqueIds[level];
         if (uniqueCount + rewardCount > uniqueIds.size()) {
-            runError = "chest unique exclusion history is full";
-            return;
+            ++runDropFailureCount;
+            runDropError = "chest unique exclusion history is full";
+            continue;
         }
         for (unsigned rewardIndex = 0; rewardIndex < rewardCount; ++rewardIndex) {
             const DWORD rewardSeed = entropy ^
@@ -7235,6 +7572,9 @@ void SettleRunAfterArrival(void* game, UnitAny* player) {
     const int level = runStage.load(std::memory_order_acquire);
     if (runGame.load(std::memory_order_acquire) != game ||
         runPlayer != player || !PortalArea(player, level)) return;
+    if (!runResume.active && runChoicePlacementPending.load(std::memory_order_acquire) &&
+        ObservationTelemetry::MatchesContext(runEpoch, game, player))
+        ServerSpawns::OfferChoices(game, level);
     if (level == 20 && runClearRetry.load(std::memory_order_acquire))
         ServerSpawns::TryCompleteClear(game, level);
     if (level != 20) {
@@ -7273,6 +7613,12 @@ int __fastcall ChatHook(void* game, UnitAny* player, BYTE* packet, int size) {
     }
     if (command == "run settle") {
         SettleRunAfterArrival(game, player);
+        return 0;
+    }
+    if (command == kAutoEntranceCommand) {
+        auto expected = AutoEntrance::Queued;
+        if (autoEntrance.compare_exchange_strong(expected, AutoEntrance::Handled))
+            ReportStart(game, player, StartTownRun(game, player));
         return 0;
     }
     if (command == "run start") {
@@ -7582,7 +7928,7 @@ void ApplyStockMapMonster(void* game, UnitAny* monster, int area) {
         !zoneSlots[area].configured || !mapMonsterCount)
         return;
     const HMODULE mod = GetModuleHandleA("ProjectDiablo.dll");
-    const BYTE* entry = mod ? reinterpret_cast<const BYTE*>(mod) + 0x2dba50 : nullptr;
+    const BYTE* entry = mod ? reinterpret_cast<const BYTE*>(mod) + 0x38aa70 : nullptr;
     if (!entry) return;
     using MonsterApplicator = int (__fastcall*)(void*, UnitAny*, void*, int);
     auto apply = reinterpret_cast<MonsterApplicator>(const_cast<BYTE*>(entry));
@@ -7609,7 +7955,7 @@ void ApplyStockMapMonster(void* game, UnitAny* monster, int area) {
         changed = true;
     }
     if (changed) {
-        const BYTE* refresh = reinterpret_cast<const BYTE*>(mod) + 0x2778f0;
+        const BYTE* refresh = reinterpret_cast<const BYTE*>(mod) + 0x30bd90;
         using Refresh = void (__stdcall*)(UnitAny*);
         reinterpret_cast<Refresh>(const_cast<BYTE*>(refresh))(monster);
     }
@@ -7647,7 +7993,7 @@ void OnPopulationCompleted(int level) {
         else CompleteArenaEncounter(game, runPlayer, level);
     }
 }
-struct BossCandidate { int classId = -1, superuniqueId = -1; };
+struct BossCandidate { int classId = -1, superuniqueId = -1; unsigned act = 5; };
 template <typename Visit>
 bool ForEachBossCatalog(const char* table, Visit visit, std::string& error) {
     int total = -1;
@@ -7688,11 +8034,35 @@ struct BossSelection {
     const sgptDataTable* tables = nullptr;
     std::minstd_rand* random = nullptr;
     unsigned depth = 0;
+    unsigned availableActs = 0;
     unsigned candidates = 0;
     std::array<std::uint64_t, 512> superuniqueClasses{};
     BossCandidate selected{};
 };
+unsigned CampaignBossAct(int classId, int superuniqueId) {
+    if (superuniqueId >= 0) {
+        // S14 SuperUniques hcIdx, including exceptions to campaign row order.
+        if (superuniqueId <= 9 || superuniqueId == 20 ||
+            superuniqueId == 39 || superuniqueId == 40) return 0;
+        if (superuniqueId <= 19) return 1;
+        if (superuniqueId <= 31) return 2;
+        if ((superuniqueId >= 36 && superuniqueId <= 38) || superuniqueId == 41) return 3;
+        if (superuniqueId >= 42 && superuniqueId <= 65) return 4;
+        return 5;
+    }
+    switch (classId) {
+    case 156: case 267: case 365: return 0; // Andariel, Blood Raven, Griswold
+    case 211: case 229: case 250: return 1; // Duriel, Radament, Summoner
+    case 242: return 2; // Mephisto
+    case 243: case 256: return 3; // Diablo, Izual
+    case 526: case 544: return 4; // Nihlathak, Baal
+    default: return 5;
+    }
+}
 void ChooseBossCandidate(BossSelection& selection, BossCandidate candidate) {
+    candidate.act = CampaignBossAct(candidate.classId, candidate.superuniqueId);
+    if (selection.availableActs &&
+        !(selection.availableActs & RoguelikeProgression::ActBit(candidate.act))) return;
     if ((*selection.random)() % ++selection.candidates == 0)
         selection.selected = candidate;
 }
@@ -7760,7 +8130,8 @@ bool ConsiderBossMonster(const json& row, BossSelection& selection,
     return true;
 }
 bool SelectBossCandidate(void* game, unsigned depth,
-    std::minstd_rand& random, BossCandidate& selected, std::string& error) {
+    std::minstd_rand& random, BossCandidate& selected, std::string& error,
+    unsigned availableActs) {
     sgptDataTable* tables = Tables();
     if (!game || depth == 0 || depth > 99 || !tables ||
         !tables->pMonStatsTxt || !tables->dwMonStatsRecs) {
@@ -7772,6 +8143,7 @@ bool SelectBossCandidate(void* game, unsigned depth,
     selection.tables = tables;
     selection.random = &random;
     selection.depth = depth;
+    selection.availableActs = availableActs;
     if (!ForEachBossCatalog("superuniques",
             [&](const json& row, std::string& detail) {
                 return ConsiderSuperuniqueBoss(row, selection, detail);
@@ -7794,7 +8166,7 @@ bool SelectVanillaEncounterPool(unsigned depth, std::minstd_rand& random,
     const std::array<std::uint16_t, 2>& excludedPrimaries,
     unsigned excludedCount,
     RoguelikeProgression::EncounterSelection& selection,
-    int& densityBaseline, std::string& error) {
+    int& densityBaseline, std::string& error, unsigned availableActs) {
     selection = {};
     densityBaseline = 0;
     sgptDataTable* table = Tables();
@@ -7816,6 +8188,7 @@ bool SelectVanillaEncounterPool(unsigned depth, std::minstd_rand& random,
         if (!Readable(row, sizeof(LevelsTxt))) continue;
         auto& area = areas[id - 1];
         area.id = id;
+        area.act = row->nAct;
         area.selections = row->dwNumMon & 0xFF;
         for (unsigned difficulty = 0; difficulty < 3; ++difficulty) {
             area.levels[difficulty] = row->wMonLvlEx[difficulty];
@@ -7834,7 +8207,8 @@ bool SelectVanillaEncounterPool(unsigned depth, std::minstd_rand& random,
     };
     if (!RoguelikeProgression::SelectVanillaEncounters(
             areas.data(), areas.size(), depth, table->dwMonStatsRecs,
-            spawnable, random, selection, excludedPrimaries, excludedCount)) {
+            spawnable, random, selection, excludedPrimaries, excludedCount,
+            availableActs)) {
         error = "vanilla progression has no spawnable classes or density";
         return false;
     }
@@ -7866,7 +8240,8 @@ bool RollChoiceZone(void* game, int target, unsigned progressed,
     const RoguelikeProgression::EncounterSelection& naturalEncounter,
     int naturalDensityBaseline, std::minstd_rand& random,
     Pending::Zone& zone, std::string& error, bool allowMarket = true,
-    std::optional<Pending::ZoneKind> forcedKind = std::nullopt) {
+    std::optional<Pending::ZoneKind> forcedKind = std::nullopt,
+    unsigned bossActs = 0, unsigned* sourceAct = nullptr) {
     if (forcedKind && *forcedKind == Pending::ZoneKind::Merchant &&
         !RoguelikeProgression::CanOfferKind(
             RoguelikeProgression::OfferKind::Market, allowMarket)) {
@@ -7879,7 +8254,7 @@ bool RollChoiceZone(void* game, int target, unsigned progressed,
     Pending::ZoneKind kind = forcedKind.value_or(rolledKind);
     BossCandidate boss{};
     if (kind == Pending::ZoneKind::Boss &&
-        !SelectBossCandidate(game, progressed, random, boss, error)) {
+        !SelectBossCandidate(game, progressed, random, boss, error, bossActs)) {
         if (forcedKind ||
             error != "no compact spawnable boss candidate is available")
             return false;
@@ -7953,29 +8328,91 @@ bool RollChoiceZone(void* game, int target, unsigned progressed,
             zone.monsterClasses[index] = naturalEncounter.classes[index];
     }
     zone.densityBaseline = natural ? naturalDensityBaseline : 0;
+    if (sourceAct) *sourceAct = BossZone(kind) ? boss.act : naturalEncounter.sourceActs[0];
     return true;
 }
+unsigned ArenaTheme(const sgptDataTable& table, int level) {
+    const LevelsTxt& row = zoneSlots[level].configured ?
+        zoneSlots[level].original : table.pLevelsTxt[level];
+    // Campaign palettes are visual theme tags, not the arena's engine Act.
+    return row.nPal;
+}
+bool HasCampaignThemes(const sgptDataTable& table) {
+    if (table.dwLevelsRecs <= 254 ||
+        !Readable(table.pLevelsTxt, 255 * sizeof(LevelsTxt))) return false;
+    unsigned acts = 0;
+    for (int level = 138; level <= 254; ++level)
+        acts |= RoguelikeProgression::ActBit(ArenaTheme(table, level));
+    return acts == RoguelikeProgression::allCampaignActs;
+}
+using ArenaLayouts = std::array<int, 255>;
+bool ReadArenaLayouts(const sgptDataTable& table, ArenaLayouts& layouts) {
+    // Compiled LvlPrest: LevelId=0x04, Files=0x40, File1=0x44 (60 bytes).
+    constexpr size_t size = 0x1B0;
+    const auto* presets = table.pLvlPrest;
+    if (!presets || table.dwLvlPrestRecs < 121 || table.dwLvlPrestRecs > 8192 ||
+        !Readable(presets, size * table.dwLvlPrestRecs)) return false;
+    std::array<std::string_view, 121> files{};
+    layouts.fill(-1);
+    unsigned count = 0, populated = 0;
+    for (DWORD i = 0; i < table.dwLvlPrestRecs; ++i) {
+        const BYTE* row = presets + size * i;
+        const DWORD level = *reinterpret_cast<const DWORD*>(row + 4);
+        if (!IsRunArenaLevel(level)) continue;
+        if (layouts[level] >= 0 || *reinterpret_cast<const DWORD*>(row + 0x40) != 1)
+            return false;
+        const char* path = reinterpret_cast<const char*>(row + 0x44);
+        const size_t length = strnlen_s(path, 60);
+        if (length < 5 || length >= 60 || _stricmp(path + length - 4, ".ds1") != 0)
+            return false;
+        const std::string_view file(path, length);
+        const auto match = std::find(files.begin(), files.begin() + count, file);
+        layouts[level] = static_cast<int>(match - files.begin());
+        if (match == files.begin() + count) files[count++] = file;
+        ++populated;
+    }
+    return populated == 121;
+}
+
+RoguelikeProgression::FreshArenas FreshOfferArenas(UnitAny* player,
+    std::minstd_rand& random, const sgptDataTable& table, bool themed,
+    const ArenaLayouts* layouts, const std::array<bool, 255>* offered = nullptr) {
+    RoguelikeProgression::FreshArenas fresh;
+    for (int target = 13; target <= 254; ++target) {
+        if (target == 17) target = 138;
+        if ((!offered || !(*offered)[target]) &&
+            FreshRunArenaAvailable(player, target))
+            fresh.Add({target, themed ? ArenaTheme(table, target) : 0u,
+                layouts ? (*layouts)[target] : -1});
+    }
+    fresh.Shuffle(random);
+    return fresh;
+}
+
 void OfferChoices(void* game, int level, const RunLayout* supplied) {
+    runChoicePlacementPending.store(false, std::memory_order_release);
+    if (!runError.empty() || level < 0 || level >= 255 || runRouteNext[level] >= 0)
+        return;
     if (!runPlayer || !runPlayer->pPath) {
         runError = "choice layout has no current run player"; return;
     }
-    if (level < 0 || level >= 255 || runRouteNext[level] >= 0) return;
     RunLayout planned{};
-    if (!supplied) {
-        if (!PlanRunLayout(D2COMMON_GetRoomFromUnit(runPlayer), runPlayer,
-                           0, planned)) {
-            runError = "no spacious, reachable choice layout"; return;
-        }
-        supplied = &planned;
+    const unsigned choiceCount = supplied ? 3 : PlanClearChoices(
+        D2COMMON_GetRoomFromUnit(runPlayer), runPlayer, planned);
+    if (!choiceCount) {
+        runChoicePlacementPending.store(true, std::memory_order_release);
+        return;
     }
-    std::array<int, 121> fresh{};
-    unsigned freshCount = 0;
-    for (int target = 13; target <= 254; ++target) {
-        if (target == 17) target = 138;
-        if (FreshRunArenaAvailable(runPlayer, target))
-            fresh[freshCount++] = target;
+    if (!supplied) supplied = &planned;
+    const auto* table = Tables();
+    ArenaLayouts layouts{};
+    if (!table || !table->pLevelsTxt) {
+        runError = "arena theme table unavailable"; return;
     }
-    if (freshCount < 3) return;
+    const bool themed = HasCampaignThemes(*table);
+    if (themed && !ReadArenaLayouts(*table, layouts)) {
+        runError = "compiled arena layout inventory is unverified"; return;
+    }
     std::string catalogError;
     if (!MapCatalog(catalogError)) {
         runError = "stock map-affix catalog rejected: " + catalogError; return;
@@ -7983,40 +8420,48 @@ void OfferChoices(void* game, int level, const RunLayout* supplied) {
     const DWORD frame = *reinterpret_cast<const DWORD*>(
         reinterpret_cast<const BYTE*>(game) + 0xA8);
     std::minstd_rand random(GetTickCount() ^ frame ^ (level * 2654435761u));
-    std::shuffle(fresh.begin(), fresh.begin() + freshCount, random);
+    auto fresh = FreshOfferArenas(runPlayer, random, *table, themed,
+        themed ? &layouts : nullptr);
     unsigned progressed = runRootLevel == 20 ? 2 : 1;
     for (int arena = 13; arena <= 254; ++arena) {
         if (arena == 17) arena = 138;
         if (zoneSlots[arena].configured) ++progressed;
     }
-    std::array<RoguelikeProgression::EncounterSelection, 3> encounters{};
     std::array<std::uint16_t, 2> primaryClasses{};
-    std::array<int, 3> densityBaselines{};
-    std::string encounterError;
-    for (unsigned index = 0; index < encounters.size(); ++index) {
-        if (!SelectVanillaEncounterPool(progressed, random, primaryClasses,
-                index, encounters[index], densityBaselines[index], encounterError)) {
-            runError = "vanilla encounter progression rejected: " + encounterError;
+    unsigned createdCount = 0;
+    bool marketAllowed = true;
+    for (unsigned index = 0; index < choiceCount; ++index) {
+        const unsigned availableActs = fresh.AvailableActs();
+        if (!availableActs) {
+            if (!createdCount) runError = "run has no unused destinations";
             return;
         }
-        if (index < primaryClasses.size())
-            primaryClasses[index] = encounters[index].classes[0];
-    }
-    std::array<DWORD, 3> created{};
-    unsigned createdCount = 0;
-    const auto rollback = [&] {
-        for (unsigned i = 0; i < createdCount; ++i) {
-            const DWORD id = created[i];
-            UnitAny* unit = FindServerObject(game, id);
-            if (unit && RemoveOwnedObject(game, runPlayer, id, unit)) {
-                std::lock_guard<std::mutex> lock(mutex);
-                choiceNames.erase(id);
-                ForgetRunOwnedObject(game, id, unit);
-            }
+        const unsigned acts = themed ? availableActs : RoguelikeProgression::allCampaignActs;
+        RoguelikeProgression::EncounterSelection encounter{};
+        int densityBaseline = 0;
+        std::string encounterError;
+        if (!SelectVanillaEncounterPool(progressed, random, primaryClasses,
+                index, encounter, densityBaseline, encounterError, acts)) {
+            if (!createdCount)
+                runError = "vanilla encounter progression rejected: " + encounterError;
+            return;
         }
-    };
-    bool marketAllowed = true;
-    for (unsigned index = 0; index < 3; ++index) {
+        if (index < primaryClasses.size()) primaryClasses[index] = encounter.classes[0];
+        unsigned sourceAct = encounter.sourceActs[0];
+        Pending::Zone zone{};
+        std::string rollError;
+        if (!RollChoiceZone(game, 0, progressed, encounter, densityBaseline,
+                random, zone, rollError, marketAllowed, std::nullopt,
+                themed ? acts : 0, &sourceAct)) {
+            if (!createdCount) runError = "stock map-affix roll failed: " + rollError;
+            return;
+        }
+        const int target = themed ? fresh.TakeLayout(sourceAct, random) : fresh.Take(0);
+        if (!target) {
+            if (!createdCount) runError = "no eligible destination for the rolled encounter";
+            return;
+        }
+        zone.level = target;
         auto choice = std::make_shared<Pending>();
         choice->id = "native-choice:" + runEpoch + ":" +
             std::to_string(++runChoiceSerial);
@@ -8024,22 +8469,19 @@ void OfferChoices(void* game, int level, const RunLayout* supplied) {
         choice->runSerial = runActiveSerial;
         choice->playerId = runPlayer->dwUnitId;
         choice->triggerSource = level;
-        choice->triggerJob = fresh[index];
-        Pending::Zone zone{};
-        std::string rollError;
-        if (!RollChoiceZone(game, fresh[index], progressed, encounters[index],
-                densityBaselines[index], random, zone, rollError, marketAllowed)) {
-            runError = "stock map-affix roll failed: " + rollError;
-            rollback();
-            return;
-        }
+        choice->triggerJob = target;
         choice->zoneJob = zone;
         json result = CreateTrigger(game, runPlayer, *choice,
-            &supplied->portals[index]);
+            &supplied->portals[index], supplied->portalRoom);
         if (!result.value("ok", false) || !result.contains("object_id") ||
             !result["object_id"].is_number_unsigned()) {
-            runError = "three-choice creation failed on a certified clear";
-            rollback();
+            if (result.value("status", "") == "tile_obstructed") {
+                // No factory call was made. Preserve earlier choices, or replan if none.
+                if (!createdCount)
+                    runChoicePlacementPending.store(true, std::memory_order_release);
+            } else if (result.value("status", "") == "uncertain" || !createdCount) {
+                if (runError.empty()) runError = "choice creation failed on a certified clear";
+            }
             return;
         }
         choice->completed = true;
@@ -8049,11 +8491,10 @@ void OfferChoices(void* game, int level, const RunLayout* supplied) {
             ownedJobs.emplace(choice->id, choice);
             portalReceipts.emplace(choice->id, std::make_pair("native-clear", result));
         }
-        created[createdCount++] = result["object_id"].get<DWORD>();
+        ++createdCount;
         marketAllowed = marketAllowed &&
             zone.kind != Pending::ZoneKind::Merchant;
     }
-    runError.clear();
 }
 // Effect-specific rerolls keep the selected destination; the original Talisman
 // still replaces it with a newly rolled destination.
@@ -8206,25 +8647,28 @@ bool RerollOfferedChoice(void* game, UnitAny* player,
     const int oldTarget = *choice->triggerJob;
     int newTarget = oldTarget;
     Pending::Zone newZone{};
+    const auto* themeTable = Tables();
+    const bool themed = themeTable && HasCampaignThemes(*themeTable);
     if (effect == RoguelikeLoot::RerollEffect::Random) {
-        std::array<int, 121> fresh{};
-        unsigned freshCount = 0;
-        for (int target = 13; target <= 254; ++target) {
-            if (target == 17) target = 138;
-            if (offered[target] || !FreshRunArenaAvailable(player, target))
-                continue;
-            fresh[freshCount++] = target;
-        }
-        if (!freshCount) return false;
-        std::shuffle(fresh.begin(), fresh.begin() + freshCount, random);
+        if (!themeTable || !themeTable->pLevelsTxt) return false;
+        ArenaLayouts layouts{};
+        if (themed && !ReadArenaLayouts(*themeTable, layouts)) return false;
+        auto fresh = FreshOfferArenas(player, random, *themeTable, themed,
+            themed ? &layouts : nullptr, &offered);
+        const unsigned acts = themed ? fresh.AvailableActs() :
+            RoguelikeProgression::allCampaignActs;
         std::string error;
         if (!SelectVanillaEncounterPool(choice->zoneJob->depth, random,
-                noExcluded, 0, encounter, densityBaseline, error)) return false;
+                noExcluded, 0, encounter, densityBaseline, error, acts)) return false;
+        unsigned sourceAct = encounter.sourceActs[0];
         if (!MapCatalog(error) ||
-            !RollChoiceZone(game, fresh[0], choice->zoneJob->depth,
+            !RollChoiceZone(game, 0, choice->zoneJob->depth,
                 encounter, densityBaseline, random, newZone, error,
-                !marketAlreadyOffered)) return false;
-        newTarget = fresh[0];
+                !marketAlreadyOffered, std::nullopt, themed ? acts : 0,
+                &sourceAct)) return false;
+        newTarget = themed ? fresh.TakeLayout(sourceAct, random) : fresh.Take(0);
+        if (!newTarget) return false;
+        newZone.level = newTarget;
     } else {
         Pending::ZoneKind zoneKind{};
         Pending::RewardFocus rewardFocus{};
@@ -8233,13 +8677,16 @@ bool RerollOfferedChoice(void* game, UnitAny* player,
             RoguelikeProgression::EncounterSelection encounter{};
             const std::array<std::uint16_t, 2> noExcluded{};
             int densityBaseline = 0;
+            const unsigned acts = themed ?
+                RoguelikeProgression::ActBit(ArenaTheme(*themeTable, oldTarget)) :
+                RoguelikeProgression::allCampaignActs;
             if (zoneKind == Pending::ZoneKind::Monster &&
                 !SelectVanillaEncounterPool(choice->zoneJob->depth, random,
-                    noExcluded, 0, encounter, densityBaseline, error))
+                    noExcluded, 0, encounter, densityBaseline, error, acts))
                 return false;
             if (!RollChoiceZone(game, oldTarget, choice->zoneJob->depth,
                     encounter, densityBaseline, random, newZone, error,
-                    !marketAlreadyOffered, zoneKind)) return false;
+                    !marketAlreadyOffered, zoneKind, themed ? acts : 0)) return false;
         } else if (RerollRewardFocus(effect, rewardFocus)) {
             if (choice->zoneJob->kind != Pending::ZoneKind::Monster &&
                 !BossZone(choice->zoneJob->kind)) return false;
@@ -8262,7 +8709,7 @@ bool RerollOfferedChoice(void* game, UnitAny* player,
         wcsnlen_s(monsterName, 48) == 48) return false;
     ChoiceName replacement{choice->playerId, choice->triggerSource,
         choice->expectedEpoch, {}};
-    if (!FormatChoiceName(replacement.text, monsterName, newZone, false))
+    if (!FormatChoiceName(replacement.text, monsterName, newZone, false, *tables, newTarget))
         return false;
     if (!ConsumeRunItem(game, player, item, itemText->szCode)) return false;
     {
@@ -8408,6 +8855,22 @@ bool DropBossCorruptedUniques(void* game, UnitAny* player, UnitAny* boss,
     }
     return true;
 }
+void ReportRemainingMonsters(void* game, int level, UnitAny* defender) {
+    if (!runPopulationReady[level] || !Readable(defender->pMonsterData, sizeof(*defender->pMonsterData)) ||
+        !Readable(defender->pMonsterData->pMonStatsTxt, sizeof(MonStatsTxt))) return;
+    const auto& row = *defender->pMonsterData->pMonStatsTxt;
+    if (!row.dwFlags.bKillable || row.dwFlags.bNPC || row.dwFlags.binTown ||
+        D2COMMON_GetUnitStat(defender, STAT_ALIGNMENT, 0) != 0) return;
+    unsigned remaining = 0;
+    if (ServerMonsters::QueryRoomClear(game, runPlayer, level, &remaining) ==
+        ServerMonsters::RoomClearState::Unavailable) return;
+    BYTE message[48] = {0x15, 1, 0};
+    const int length = std::snprintf(reinterpret_cast<char*>(message + 3), sizeof(message) - 3,
+        remaining == 1 ? "%u monster remains" : "%u monsters remain", remaining);
+    if (length > 0 && static_cast<size_t>(length) < sizeof(message) - 3)
+        originalChat(game, runPlayer, message, length + 4);
+}
+
 void OnNaturalKill(void* game, UnitAny* defender) {
     if (runGame.load(std::memory_order_acquire) != game || !game || !runPlayer ||
         !defender || defender->dwType != UNIT_MONSTER ||
@@ -8422,10 +8885,13 @@ void OnNaturalKill(void* game, UnitAny* defender) {
         !PortalArea(runPlayer, level) ||
         !ObservationTelemetry::MatchesContext(runEpoch, game, runPlayer))
         return;
-    if (runEncounters[level] == 3 ||
-        (ExtraBossCount(zoneSlots[level].affixes) && !runBossUnit[level]) ||
-        !runError.empty())
+    ReportRemainingMonsters(game, level, defender);
+    if (runEncounters[level] == 3 || !runError.empty()) return;
+    if (runEncounters[level] == kEncounterDegraded) {
+        TryCompleteClear(game, level);
         return;
+    }
+    if (ExtraBossCount(zoneSlots[level].affixes) && !runBossUnit[level]) return;
     if (BossZone(zoneSlots[level].kind))
         runBossKillWitness.store(true, std::memory_order_release);
     const int monsterLevel = level == 20 ? 1 :
@@ -8434,7 +8900,9 @@ void OnNaturalKill(void* game, UnitAny* defender) {
     const int itemLevel = RoguelikeLoot::RewardItemLevel(monsterLevel,
         zoneSlots[level].depth, zoneSlots[level].testOnly);
     if (itemLevel < 1 || itemLevel > 99) {
-        runError = "monster loot has no valid zone item level";
+        ++runDropFailureCount;
+        runDropError = "monster loot has no valid zone item level";
+        TryCompleteClear(game, level);
         return;
     }
     if (runKillLootLedgerLevel != level) {
@@ -8443,7 +8911,9 @@ void OnNaturalKill(void* game, UnitAny* defender) {
     }
     const KillLootClaim claim = ClaimKillLoot(defender->dwUnitId);
     if (claim == KillLootClaim::Full) {
-        runError = "per-zone monster loot deduplication ledger is full";
+        ++runDropFailureCount;
+        runDropError = "per-zone monster loot deduplication ledger is full";
+        TryCompleteClear(game, level);
         return;
     }
     if (claim == KillLootClaim::Duplicate) {
@@ -8477,10 +8947,13 @@ json DropFocusedClearPrimary(void* game, UnitAny* player, int itemLevel,
     const int quality = focus == Pending::RewardFocus::Unique ? 7 :
         focus == Pending::RewardFocus::Set ? 5 :
         sockets ? 2 :
-        zone.affixes.quality == RoguelikeAffixes::Quality::Magic ? 4 :
-        zone.affixes.quality == RoguelikeAffixes::Quality::Rare ? 6 : 2;
+        RunEquipmentQuality(
+            zone.affixes.quality == RoguelikeAffixes::Quality::Magic ? 4 :
+            zone.affixes.quality == RoguelikeAffixes::Quality::Rare ? 6 : 2,
+            playerLevel, seed, zone.depth == 1);
     return DropRunReward(game, player, itemLevel, playerLevel,
-        quality, false, seed, sockets ? 1 : 0);
+        quality, zone.depth == 1 && focus == Pending::RewardFocus::Equipment,
+        seed, sockets ? 1 : 0);
 }
 bool AwardFocusedClearLoot(void* game, UnitAny* player, int level) {
     const ZoneSlot& zone = zoneSlots[level];
@@ -8513,13 +8986,16 @@ bool AwardFocusedClearLoot(void* game, UnitAny* player, int level) {
 }
 void TryCompleteClear(void* game, int level) {
     if (!runError.empty() || runCleared[level]) return;
+    const bool degraded = runEncounters[level] == kEncounterDegraded;
+    if (degraded && runResume.active) return;
     const auto clear = ServerMonsters::QueryRoomClear(game, runPlayer, level);
-    runClearRetry.store(clear == ServerMonsters::RoomClearState::Unavailable,
+    runClearRetry.store(clear == ServerMonsters::RoomClearState::Unavailable ||
+        (degraded && clear == ServerMonsters::RoomClearState::LivingHostiles),
         std::memory_order_release);
     if (clear != ServerMonsters::RoomClearState::Clear) return;
     if (level == 20 && !runStarterRewardId) {
         const json reward = DropRunReward(game, runPlayer, 1,
-            MarketCharacterLevel(), 2, true,
+            MarketCharacterLevel(), 4, true,
             GetTickCount() ^ runPlayer->dwUnitId);
         if (reward.value("ok", false))
             runStarterRewardId = reward["item_id"].get<DWORD>();
@@ -8569,7 +9045,34 @@ void RequestRunAuraPulse() {
     memcpy(packet + 3, "run aura", sizeof("run aura") - 1);
     D2NET_SendPacket(sizeof(packet), 0, packet);
 }
+void RequestAutomaticEntrance() {
+    if (autoEntrance.load(std::memory_order_acquire) != AutoEntrance::Waiting ||
+        !hookPairReady.load(std::memory_order_acquire) || !IsGameReady() ||
+        !PortalArea(D2CLIENT_GetPlayerUnit(), 1)) return;
+    const auto* client = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2Client.dll"));
+    if (!client) return;
+    // Pinned 1.13c client startup: check the absolute mode load and its zero branch.
+    const BYTE tail[] = {0x33,0xff,0x3b,0xc3,0x75,0x17};
+    const BYTE* site = client + 0x44cee;
+    const auto* mode = reinterpret_cast<const DWORD*>(client + 0x11c394);
+    DWORD operand = 0;
+    if (!Readable(site, 5 + sizeof(tail)) || !Readable(mode, sizeof(*mode))) return;
+    memcpy(&operand, site + 1, sizeof(operand));
+    constexpr wchar_t starterName[] = L"The Abyss - Level 1";
+    const wchar_t* title = D2CLIENT_GetLevelName(20);
+    const bool eligible = site[0] == 0xa1 && operand == reinterpret_cast<DWORD>(mode) &&
+        !memcmp(site + 5, tail, sizeof(tail)) && *mode == 0 &&
+        Readable(title, sizeof(starterName)) && !memcmp(title, starterName, sizeof(starterName));
+    auto expected = AutoEntrance::Waiting;
+    if (!autoEntrance.compare_exchange_strong(expected,
+            eligible ? AutoEntrance::Queued : AutoEntrance::Handled) || !eligible) return;
+    // Native chat framing: command NUL, recipient NUL, extension length zero.
+    BYTE packet[5 + sizeof(kAutoEntranceCommand)] = {0x15, 1, 0};
+    memcpy(packet + 3, kAutoEntranceCommand, sizeof(kAutoEntranceCommand) - 1);
+    D2NET_SendPacket(sizeof(packet), 0, packet);
+}
 void SettleRunFrame() {
+    RequestAutomaticEntrance();
     HandleRunDeath();
     RequestRunAuraPulse();
     const int level = runStage.load(std::memory_order_acquire);
@@ -8605,14 +9108,15 @@ void SettleRunFrame() {
         runError.empty() &&
         (!runChestSettled[level][0] || !runChestSettled[level][1] ||
          !runChestSettled[level][2]);
-    if (!runGame.load(std::memory_order_acquire) ||
-        (level == 20 ? (runStarterSettled.load(std::memory_order_acquire) &&
-            !runClearRetry.load(std::memory_order_acquire)) :
-            level < 13 || level > 254 ||
-            (!runBossKillWitness.load(std::memory_order_acquire) &&
-             !runClearRetry.load(std::memory_order_acquire) && !chestPending))) return;
-    if (!PortalArea(player, level)) return;
-    // Empty starter population and witnessed clears can require a later server frame.
+    const bool placementPending = runChoicePlacementPending.load(std::memory_order_acquire);
+    const bool clearPending = runClearRetry.load(std::memory_order_acquire);
+    if (!game || level < 13 || level > 254 || !PortalArea(player, level)) return;
+    const bool starterPending = level == 20 &&
+        !runStarterSettled.load(std::memory_order_acquire);
+    if (!placementPending && !clearPending && !starterPending && !chestPending &&
+        !runBossKillWitness.load(std::memory_order_acquire)) return;
+    // Empty starter population, witnessed clears, and safe placement retries
+    // can require a later server frame.
     static DWORD nextAttempt = 0;
     const DWORD now = GetTickCount();
     if (static_cast<LONG>(now - nextAttempt) < 0) return;
@@ -8667,6 +9171,7 @@ void RestoreRoguelikeZones(bool saveSnapshot) {
     runStarterSettled.store(false, std::memory_order_release);
     runBossKillWitness.store(false, std::memory_order_release);
     runClearRetry.store(false, std::memory_order_release);
+    runChoicePlacementPending.store(false, std::memory_order_release);
     CombatTelemetry::StopRoguelikeKills();
     runStage.store(0, std::memory_order_release);
     runRootLevel = 0;
@@ -8720,6 +9225,7 @@ void RestoreRoguelikeZones(bool saveSnapshot) {
     if (saveSnapshot) ForgetRunOwnedObjects();
 }
 void RestoreRoguelikeZones() {
+    autoEntrance.store(AutoEntrance::Waiting, std::memory_order_release);
     RestoreRoguelikeZones(true);
 }
 void HandleRunDeath() {

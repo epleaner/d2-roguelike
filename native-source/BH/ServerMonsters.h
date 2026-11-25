@@ -25,7 +25,7 @@ enum class Operation { Spawn, Inspect, Area, Observe };
 // Unavailable never certifies an empty room; the caller owns witnessed-kill policy.
 enum class RoomClearState { Clear, LivingHostiles, Unavailable };
 bool PrepareRoomClear(std::string& error);
-RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel);
+RoomClearState QueryRoomClear(void* game, UnitAny* player, DWORD expectedLevel, unsigned* remaining = nullptr);
 struct Request {
     Operation operation = Operation::Spawn;
     std::vector<Enemy> enemies;

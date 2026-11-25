@@ -34,10 +34,10 @@ class Launcher(tk.Tk):
         ttk.Label(heading, image=self.portal_image).grid(row=0, column=0, padx=(0, 12))
         ttk.Label(heading, text="PD2 Roguelike", font=("TkDefaultFont", 18, "bold")).grid(
             row=0, column=1, sticky="w")
-        ttk.Label(frame, text="Single Player only • PD2 Season 13 patch 2\n"
+        ttk.Label(frame, text="Single Player only • PD2 Season 14 patch 2\n"
                               "The selected folder will be modified. Copy PD2 first to protect your original.\n"
                               "This does not block PD2 Online; using the mod online may risk your account.\n"
-                              "In town, type run start.",
+                              "In Single Player, click Enter the Abyss or Return to the Abyss.",
                   justify="left", wraplength=560).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 12))
         ttk.Label(frame, text="PD2 installation folder to modify").grid(row=2, column=0, columnspan=2, sticky="w")
         self.folder_entry = ttk.Entry(frame, textvariable=self.folder)
@@ -71,7 +71,7 @@ class Launcher(tk.Tk):
         try:
             names = ("Python.txt", "PyInstaller.txt", "OpenSSL.txt", "zlib.txt",
                      "StormLib.txt", "StormLib-components.txt", "BH-AGPL.txt", "BH-Apache.txt",
-                     "Native-components.txt", "Portal-art.txt")
+                     "Native-components.txt", "Portal-art.txt", "DS1-Studio.txt")
             notices = [(name, (directory / name).read_text(encoding="utf-8")) for name in names]
         except (OSError, UnicodeError, ValueError) as error:
             messagebox.showerror("PD2 Roguelike", str(error), parent=self)

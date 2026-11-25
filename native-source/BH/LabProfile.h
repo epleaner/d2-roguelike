@@ -7,6 +7,7 @@ namespace LabProfile {
     bool VerifyClient(std::string& error);
     bool VerifyCommon(std::string& error);
     bool VerifyServer(std::string& error);
+    bool VerifyMod(std::string& error);
     bool BackendFileIdentity(std::string& digest);
     bool ModFileIdentity(std::string& digest);
     const std::string& Token();
