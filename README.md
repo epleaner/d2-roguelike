@@ -44,7 +44,15 @@ Softcore death ends the run and resets character progression to level one. Norma
 
 ### Loot filters
 
-The default filter has no hide rules. A third-party filter may hide or rename these items: elixirs use the healing-potion item type, while Talismans and Edicts use the scroll type. If an item is missing, try the **Show All Items** filter level or turn off the loot filter. To keep a custom filter, add rules for the item codes above before any matching hide rules. See the [PD2 filter guide](https://wiki.projectdiablo2.com/wiki/Item_Filtering) for syntax and rule order.
+The default filter has no hide rules. A third-party filter may hide or rename these items: aura elixirs use the healing-potion item type, while the Talisman and Edicts use the scroll type.
+
+To keep all **31 Roguelike items** visible with their normal names in your existing custom filter, use the opt-in [copy-paste rules](roguelike-filter-rules.txt):
+
+1. In your copied Diablo II installation, find the filter currently selected in the PD2 launcher. Back up that filter first. If `ProjectD2\loot.filter` is a link to a file under `ProjectD2\filters`, edit the selected filter file it points to, not a replacement `loot.filter`. PD2 recommends keeping personal edits in `ProjectD2\filters\local` and selecting that local filter in the launcher so public filter updates do not overwrite them.
+2. Copy the **contents** of `roguelike-filter-rules.txt` into the **top** of your existing filter, before any hide, rename, or catch-all rules that might match these items. Do not install the snippet by itself as a new filter: it does not contain your other rules and cannot preserve their behavior alone. Leave the rest of your filter unchanged.
+3. Save the selected filter file and reload it in game (default hotkey **Numpad 0**, configurable in Configure Controls). Make sure **Enable Loot Filter** is on. If an item is still missing, try the **Show All Items** filter level or temporarily disable the loot filter.
+
+The Roguelike launcher does **not** automatically modify your selected filter or paste these rules. The rules match only the 31 released custom item codes; other items continue through your existing rules. See the [PD2 filter guide](https://wiki.projectdiablo2.com/wiki/Item_Filtering) for syntax, rule order, filter selection, and reload controls.
 
 ## Install
 
@@ -67,6 +75,8 @@ After a Softcore death, type `run start` in game chat to open a new entrance in 
 The launcher checks for mod updates when you click **Play**. If the update service is unavailable, it reports the error and can still launch a valid existing installation. Updates preserve character saves and route snapshots.
 
 The launcher checks the game files against the supported version. If it rejects your installation, check that it is S14 Patch #2 and that you selected the full Diablo II folder, not just `ProjectD2`. Use a short path containing only ASCII characters.
+
+The launcher accepts a `ProjectD2\loot.filter` link only when it points to a regular filter file inside the copied installation's `ProjectD2\filters` folder. If a copied link still points to your original installation, select a local filter in the copied PD2 launcher so it creates a link within the copy; do not change the original installation's filter.
 
 ## Source and notices
 

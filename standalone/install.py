@@ -75,9 +75,56 @@ def _walk(root: Path):
             yield Path(directory) / name
 
 
+def _filter_target(link: Path) -> Path | None:
+    try:
+        raw = os.readlink(link)
+    except OSError:
+        return None
+    # Windows may return a local drive target in NT substitution form.
+    # Do not normalize UNC or device namespaces into accepted destinations.
+    if (raw.startswith("\\\\?\\") and len(raw) > 6 and raw[4].isascii()
+            and raw[4].isalpha() and raw[5] == ":" and raw[6] in "\\/"):
+        raw = raw[4:]
+    destination = Path(raw)
+    if ".." in destination.parts or (destination.drive and not destination.is_absolute()):
+        return None
+    return destination if destination.is_absolute() else link.parent / destination
+
+
+def _local_filter_link(link: Path, root: Path) -> bool:
+    """Admit one file symlink under the canonical, link-free selected copy.
+
+    Its immediate destination must be a regular, unshared file below this copy's
+    filters directory; every intervening component must be link-free. Neither
+    loot.filter nor filters is a managed transaction target, so validation does
+    not grant permission to open, copy, replace, or modify either one.
+    """
+    if link != root / "ProjectD2" / "loot.filter":
+        return False
+    info = link.lstat()
+    if not stat.S_ISLNK(info.st_mode) or info.st_nlink != 1:
+        return False  # Windows junctions and other reparse points are not file symlinks.
+    target = _filter_target(link)
+    if target is None:
+        return False
+    filters = root / "ProjectD2" / "filters"
+    if not target.is_relative_to(filters) or target == filters:
+        return False
+    # Check each component without opening the filter. A chained link, junction,
+    # dangling target or inaccessible destination is never accepted.
+    try:
+        _no_link_ancestors(target)
+        target_info = target.stat()
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(target_info.st_mode) and target_info.st_nlink == 1
+
+
 def _no_links_in_copy(root: Path) -> None:
     for item in _walk(root):
         if _is_link(item):
+            if _local_filter_link(item, root):
+                continue
             raise ValueError(f"The selected game folder contains a link or junction: {item}")
         if item.is_file() and item.stat().st_nlink != 1:
             raise ValueError(f"The selected game folder contains a hard-linked file: {item}")

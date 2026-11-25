@@ -1,0 +1,41 @@
+// PD2 Roguelike: paste these rules near the TOP of your existing filter,
+// before any hide, rename, or catch-all rules that could match these items.
+// Do not use this snippet as a standalone filter: it would not retain your other rules.
+// %NAME% keeps each item's normal name; no %CONTINUE% means later hide rules cannot override it.
+
+// Talisman: general portal reroll
+ItemDisplay[rrl]: %NAME% // Talisman of Transmutation
+
+// Edicts: targeted portal rerolls
+ItemDisplay[qbs]: %NAME% // Overlord's Edict (boss)
+ItemDisplay[qmt]: %NAME% // Mercantile Edict (market)
+ItemDisplay[qsh]: %NAME% // Sanctuary Edict (shrine)
+ItemDisplay[qch]: %NAME% // Plunderer's Edict (locked chest)
+ItemDisplay[qeq]: %NAME% // Armorer's Edict (equipment)
+ItemDisplay[qso]: %NAME% // Collector's Edict (socketed gear, gems, runes, jewels)
+ItemDisplay[qun]: %NAME% // Relic Hunter's Edict (unique equipment)
+ItemDisplay[qse]: %NAME% // Regalia Edict (set equipment)
+ItemDisplay[qjw]: %NAME% // Jeweler's Edict (rings and amulets)
+ItemDisplay[qcm]: %NAME% // Charmwright's Edict (charms)
+
+// Aura elixirs: each grants its named aura for 30 seconds
+ItemDisplay[ra1]: %NAME% // Elixir of Might
+ItemDisplay[rpr]: %NAME% // Elixir of Prayer
+ItemDisplay[ra2]: %NAME% // Elixir of Resist Fire
+ItemDisplay[ra3]: %NAME% // Elixir of Holy Fire
+ItemDisplay[ra4]: %NAME% // Elixir of Thorns
+ItemDisplay[ra5]: %NAME% // Elixir of Defiance
+ItemDisplay[ra6]: %NAME% // Elixir of Resist Cold
+ItemDisplay[ra7]: %NAME% // Elixir of Blessed Aim
+ItemDisplay[ra8]: %NAME% // Elixir of Cleansing
+ItemDisplay[ra9]: %NAME% // Elixir of Resist Lightning
+ItemDisplay[rb1]: %NAME% // Elixir of Concentration
+ItemDisplay[rb2]: %NAME% // Elixir of Holy Freeze
+ItemDisplay[rb3]: %NAME% // Elixir of Vigor
+ItemDisplay[rb4]: %NAME% // Elixir of Holy Shock
+ItemDisplay[rb5]: %NAME% // Elixir of Sanctuary
+ItemDisplay[rb6]: %NAME% // Elixir of Meditation
+ItemDisplay[rb7]: %NAME% // Elixir of Fanaticism
+ItemDisplay[rb8]: %NAME% // Elixir of Conviction
+ItemDisplay[rb9]: %NAME% // Elixir of Redemption
+ItemDisplay[rc1]: %NAME% // Elixir of Salvation
