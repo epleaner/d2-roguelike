@@ -442,7 +442,7 @@ json ToolsList() {
     add("use_roguelike_aura", "Use one owned Paladin Aura Elixir in an active run; observe its native aura level and item debit separately.",
         {{"request_id", text}, {"expected_epoch", text}, {"from_level", integer}, {"item_id", integer}},
         json::array({"request_id", "expected_epoch", "from_level", "item_id"}));
-    add("interact_roguelike_chest", "Click one observed stock locked chest in the current run zone; verify key use and reward through native state.",
+    add("interact_roguelike_chest", "Click one observed owned chest in the current run zone; verify its opening and rewards through native state.",
         {{"request_id", text}, {"expected_epoch", text}, {"from_level", integer}, {"object_id", integer}},
         json::array({"request_id", "expected_epoch", "from_level", "object_id"}));
     add("retire_roguelike_portals", "After arrival, retire the town entrance and Tower return (from_level 1), or the selected round's owned objects.",

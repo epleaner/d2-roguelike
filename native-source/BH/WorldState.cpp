@@ -417,6 +417,12 @@ json Units(const json& args) {
                           {"distance_chebyshev", std::max(std::abs(x - px), std::abs(y - py))}};
             if (unit->dwType == UNIT_MONSTER || unit->dwType == UNIT_OBJECT)
                 entry["distance_native"] = D2COMMON_GetUnitDistance(player, unit);
+            if (unit->dwType == UNIT_OBJECT && Valid(unit->pObjectData)) {
+                if (unit->dwTxtFileNo == 2 || unit->dwTxtFileNo == 77)
+                    entry["shrine_type"] = unit->pObjectData->Type;
+                if (unit->dwTxtFileNo == 397)
+                    entry["locked"] = bool(unit->pObjectData->ChestLocked);
+            }
             if (unit->dwType == UNIT_MONSTER) {
                 entry["owner_type"] = unit->dwOwnerType;
                 entry["owner_id"] = unit->dwOwnerId;

@@ -43,7 +43,7 @@
 
 struct RunTile { int x = 0, y = 0; };
 struct RunLayout {
-    std::array<RunTile, 4> actors{};
+    std::array<RunTile, 6> actors{};
     std::array<RunTile, 3> portals{};
     unsigned actorCount = 0;
     Room1* portalRoom = nullptr;
@@ -264,11 +264,11 @@ int runDamageOriginal = 0, runDamageApplied = 0;
 unsigned runDamageComponent = 0;
 WORD runDamageNativeLevel = 0;
 bool runDamageMissile = false;
-std::array<std::array<DWORD, 3>, 255> runShrineIds{};
+std::array<std::array<DWORD, 5>, 255> runShrineIds{};
 std::array<std::array<DWORD, 2>, 255> runClearRewardIds{};
 DWORD runStarterRewardId = 0;
 std::array<std::array<DWORD, 3>, 255> runChestIds{};
-std::array<std::array<std::array<DWORD, 4>, 3>, 255> runChestRewardIds{};
+std::array<std::array<std::array<DWORD, 5>, 3>, 255> runChestRewardIds{};
 std::array<std::array<BYTE, 3>, 255> runChestRewardCounts{};
 std::array<std::array<int, 12>, 255> runChestUniqueIds{};
 std::array<unsigned, 255> runChestUniqueCounts{};
@@ -2004,16 +2004,17 @@ bool RoguelikeMonsterDropContext(void* game, Drop* drop, int& area) {
         (zoneSlots[area].kind == Pending::ZoneKind::Monster ||
          zoneSlots[area].kind == Pending::ZoneKind::Boss);
 }
-bool RoguelikeOwnedChestDropContext(void* game, Drop* drop) {
+bool RoguelikeOwnedChestDropContext(void* game, Drop* drop, int& area) {
     if (!game || game != runGame.load(std::memory_order_acquire) ||
         !Readable(drop, sizeof(Drop)) || drop->game != game ||
         drop->spawnType != ITEM_MODE_ON_GROUND ||
         !Readable(drop->unit, sizeof(UnitAny)) ||
         drop->unit->dwType != UNIT_OBJECT || drop->unit->dwTxtFileNo != 397)
         return false;
-    const int area = runStage.load(std::memory_order_acquire);
+    area = runStage.load(std::memory_order_acquire);
     if (area < 13 || area >= 255 || !zoneSlots[area].configured ||
-        zoneSlots[area].kind != Pending::ZoneKind::Chest ||
+        (zoneSlots[area].kind != Pending::ZoneKind::Chest &&
+         zoneSlots[area].kind != Pending::ZoneKind::Shrine) ||
         !PortalArea(runPlayer, area))
         return false;
     for (const DWORD chestId : runChestIds[area])
@@ -2073,7 +2074,9 @@ int RunEquipmentQuality(int quality, int playerLevel, DWORD seed, bool firstZone
         playerLevel, EquipmentQualityRoll(seed)) ? 4 : quality;
 }
 UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
-    if (RoguelikeOwnedChestDropContext(game, drop)) {
+    int chestArea = 0;
+    if (RoguelikeOwnedChestDropContext(game, drop, chestArea)) {
+        if (zoneSlots[chestArea].kind == Pending::ZoneKind::Shrine) return nullptr;
         bool potion = false;
         if (drop->quality != 7) {
             D2ItemDataTbl* bases = nullptr;
@@ -2945,6 +2948,7 @@ json InspectLevels(void* game, UnitAny* player, const Pending& request) {
         {"run_snapshot_status", ServerSpawns::RunSnapshotStatus()},
         {"native_run", {{"armed", runGame.load(std::memory_order_acquire) == game},
             {"run_serial", runActiveSerial},
+            {"skill_shrine_state", D2COMMON_GetUnitState(player, 0x86) != 0},
             {"root_level", runRootLevel},
             {"stage", runStage.load(std::memory_order_acquire)},
             {"cleared", source < 255 && runCleared[source]},
@@ -4347,11 +4351,16 @@ bool PlanRunLayoutFrom(Room1* room, const RunTile& entry, unsigned actorCount,
     const int portalY = minY + (maxY - minY) * (playerSouth ? 3 : 1) / 4;
     const auto choose = [&](unsigned index, unsigned count, bool portal,
                             RunTile& output) {
-        const int anchorX = minX + (maxX - minX) * int(index) / int(count - 1);
-        const int anchorY = portal ? portalY : actorY;
+        const bool sanctuaryActor = !portal && actorCount == 6;
+        const unsigned column = sanctuaryActor ? index % 3 : index;
+        const unsigned columns = sanctuaryActor ? 3 : count;
+        const int anchorX = minX + (maxX - minX) * int(column) / int(columns - 1);
+        const int rowOffset = sanctuaryActor ?
+            (index < 3 ? -2 : 2) * (playerSouth ? 1 : -1) : 0;
+        const int anchorY = portal ? portalY : actorY + rowOffset;
         // A 17-tile-wide floor fits four interior merchant feet at four
         // tiles apart; the three choice portals retain wider spacing.
-        const int actorSpacing = portal ? 7 : (actorCount == 4 ? 4 : 5);
+        const int actorSpacing = portal ? 7 : (actorCount >= 4 ? 4 : 5);
         int best = INT_MAX;
         bool found = false;
         for (const RunTile& tile : candidates) {
@@ -4361,7 +4370,7 @@ bool PlanRunLayoutFrom(Room1* room, const RunTile& entry, unsigned actorCount,
                 (tile.x < minX + 2 || tile.x > maxX - 2 ||
                  tile.y < minY + 3 || tile.y > maxY - 4))
                 continue;
-            if (!portal && safeChestActors &&
+            if (!portal && safeChestActors && (!sanctuaryActor || index == 5) &&
                 (!RoguelikeLoot::InsideRoomMargin(
                     tile.x, tile.y, minX, minY, maxX, maxY, 3) ||
                  !ChestTileHasApproachSpace(map, occupied, tile)))
@@ -4464,7 +4473,10 @@ bool ChoiceRoomsConnected(const Room1* from, const Room1* to) {
 void WalkChoiceFloor(const ChoiceFloor& floor, const RunTile& entry,
     const RunLayout* layout, std::vector<BYTE>& visited, std::vector<size_t>& queue) {
     const auto blocked = [&](const RunTile& tile) {
-        return layout && std::any_of(layout->portals.begin(), layout->portals.end(),
+        if (!layout) return false;
+        for (unsigned i = 0; i < layout->actorCount; ++i)
+            if (RunTileDistance(tile, layout->actors[i]) <= 1) return true;
+        return std::any_of(layout->portals.begin(), layout->portals.end(),
             [&](const RunTile& portal) { return RunTileDistance(tile, portal) <= 1; });
     };
     const size_t start = floor.Index(entry.x, entry.y);
@@ -4494,15 +4506,41 @@ bool ChoicePortalsAccessible(const ChoiceFloor& floor, const RunTile& entry,
     std::fill(visited.begin(), visited.end(), 0);
     queue.clear();
     WalkChoiceFloor(floor, entry, &layout, visited, queue);
-    for (const RunTile& portal : layout.portals) {
-        bool reachable = false;
+    const auto approach = [&](const RunTile& target) {
         for (int dy = -2; dy <= 2; ++dy) for (int dx = -2; dx <= 2; ++dx) {
-            const int x = portal.x + dx, y = portal.y + dy;
-            if (floor.Contains(x, y) && visited[floor.Index(x, y)]) reachable = true;
+            const int x = target.x + dx, y = target.y + dy;
+            if (floor.Contains(x, y) && visited[floor.Index(x, y)]) return true;
         }
-        if (!reachable) return false;
-    }
+        return false;
+    };
+    for (const RunTile& portal : layout.portals)
+        if (!approach(portal)) return false;
+    for (unsigned i = 0; i < layout.actorCount; ++i)
+        if (!approach(layout.actors[i])) return false;
     return true;
+}
+
+bool PlanSanctuaryLayout(Room1* current, UnitAny* player, RunLayout& layout) {
+    if (PlanRunLayout(current, player, 6, layout, true)) return true;
+    if (!player || !player->pPath || !Readable(current, sizeof(Room1)) ||
+        !Readable(current->pRoom2, sizeof(Room2)) ||
+        !Readable(current->pRoom2->pLevel, sizeof(Level))) return false;
+    const RunTile entry{player->pPath->xPos, player->pPath->yPos};
+    ChoiceFloor floor;
+    if (!BuildChoiceFloor(current->pRoom2->pLevel, entry, floor)) return false;
+    std::vector<BYTE> visited(floor.owners.size()), check(floor.owners.size());
+    std::vector<size_t> cells, checked;
+    WalkChoiceFloor(floor, entry, nullptr, visited, cells);
+    std::vector<unsigned> seen(floor.rooms.size()), attempts(floor.rooms.size());
+    for (size_t cell : cells) {
+        const size_t index = floor.owners[cell] - 1;
+        const unsigned ordinal = seen[index]++;
+        if (attempts[index] >= 16 || (ordinal && ordinal % 24)) continue;
+        ++attempts[index];
+        if (PlanRunLayoutFrom(floor.rooms[index].room, floor.Tile(cell), 6, layout, true) &&
+            ChoicePortalsAccessible(floor, entry, layout, check, checked)) return true;
+    }
+    return false;
 }
 
 unsigned PlanClearChoices(Room1* current, UnitAny* player, RunLayout& layout) {
@@ -4762,7 +4800,7 @@ bool FormatChoiceName(wchar_t (&text)[2048], const wchar_t* monsterName,
     return RoguelikePortalLabels::Format(request, text, 2048);
 }
 
-json CreateZoneShrine(void* game, UnitAny* player, int objectClass,
+json CreateZoneShrine(void* game, Room1* room, int objectClass,
     BYTE shrineType, const RunTile& tile) {
     if (objectClass != 77 && objectClass != 2 ||
         (shrineType != 1 && (shrineType < 6 || shrineType > 15)))
@@ -4773,7 +4811,6 @@ json CreateZoneShrine(void* game, UnitAny* player, int objectClass,
     if (!factory || !Readable(factory, sizeof(signature)) ||
         memcmp(factory, signature, sizeof(signature)))
         return Failure("unrecognized S13 shrine object constructor");
-    Room1* room = D2COMMON_GetRoomFromUnit(player);
     if (!room || !room->Coll ||
         !RunTileFree(room, room->Coll, tile.x, tile.y))
         return Failure("planned shrine tile obstructed");
@@ -4800,19 +4837,39 @@ json CreateZoneShrine(void* game, UnitAny* player, int objectClass,
         object->pObjectPath->pRoom1 != room ||
         !Readable(object->pObjectData, sizeof(ObjectData)))
         return Failure("neutral shrine creation uncertain; inspect room before retry");
+    // The interaction type controls the label; the server dispatches the
+    // effect through the separate Shrines.txt record initialized by the factory.
+    const BYTE originalType = object->pObjectData->Type;
+    const DWORD originalRecord = object->pObjectData->_2[0];
+    constexpr DWORD shrineRecordSize = 0xB8;
+    if (!originalType || originalType > 22 ||
+        originalRecord < originalType * shrineRecordSize ||
+        !Readable(reinterpret_cast<void*>(originalRecord), shrineRecordSize) ||
+        *reinterpret_cast<const BYTE*>(originalRecord) != originalType)
+        return Failure("unrecognized initialized shrine record");
+    const DWORD records = originalRecord - originalType * shrineRecordSize;
+    for (BYTE code = 1; code <= 15; ++code) {
+        const DWORD record = records + code * shrineRecordSize;
+        if (!Readable(reinterpret_cast<void*>(record), shrineRecordSize) ||
+            *reinterpret_cast<const BYTE*>(record) != code)
+            return Failure("unrecognized shrine table layout");
+    }
+    const DWORD targetRecord = records + shrineType * shrineRecordSize;
+    object->pObjectData->_2[0] = targetRecord;
     object->pObjectData->Type = shrineType;
     return {{"ok", true}, {"status", "shrine_created"},
         {"object_id", object->dwUnitId}, {"class_id", objectClass},
         {"x", x}, {"y", y}, {"shrine_type", object->pObjectData->Type}};
 }
-json CreateZoneChest(void* game, UnitAny* player, const RunTile& tile) {
+json CreateZoneChest(void* game, UnitAny* player, const RunTile& tile,
+    bool locked = true, Room1* plannedRoom = nullptr) {
     HMODULE server = GetModuleHandleA("D2Game.dll");
     const BYTE* factory = server ? reinterpret_cast<const BYTE*>(server) + 0xE1D90 : nullptr;
     const BYTE signature[] = {0x83, 0xec, 0x08, 0x56, 0x57, 0x8b, 0xf9};
     if (!factory || !Readable(factory, sizeof(signature)) ||
         memcmp(factory, signature, sizeof(signature)))
         return Failure("unrecognized S13 chest object constructor");
-    Room1* room = D2COMMON_GetRoomFromUnit(player);
+    Room1* room = plannedRoom ? plannedRoom : D2COMMON_GetRoomFromUnit(player);
     if (!room || !room->Coll ||
         !RunTileFree(room, room->Coll, tile.x, tile.y))
         return Failure("planned chest tile is no longer free and reachable");
@@ -4841,8 +4898,8 @@ json CreateZoneChest(void* game, UnitAny* player, const RunTile& tile) {
         !Readable(object->pObjectData->pTxt, sizeof(ObjectTxt)) ||
         object->pObjectData->pTxt->nOperateFn != 4)
         return Failure("native chest creation uncertain; inspect room before retry");
-    object->pObjectData->ChestLocked = 1;
-    return {{"ok", true}, {"status", "locked_chest_created"},
+    object->pObjectData->ChestLocked = locked ? 1 : 0;
+    return {{"ok", true}, {"status", locked ? "locked_chest_created" : "chest_created"},
         {"object_id", object->dwUnitId}, {"class_id", objectClass},
         {"locked", object->pObjectData->ChestLocked != 0},
         {"x", x}, {"y", y}};
@@ -5425,6 +5482,35 @@ json SpawnBossEncounter(void* game, UnitAny* player, int level,
     return {{"ok", true}, {"status", "boss_population"},
         {"boss", result["enemies"][0]}, {"spawn", result}};
 }
+json CreateSanctuaryEvent(void* game, UnitAny* player, int level,
+    const ZoneSlot& zone, const RunLayout& layout) {
+    json healing = CreateZoneShrine(game, layout.portalRoom, 77, 1, layout.actors[0]);
+    if (!healing.value("ok", false)) return healing;
+    json others = json::array();
+    const BYTE types[] = {15, 14, 12, zone.otherShrine};
+    for (unsigned index = 0; index < 4; ++index) {
+        json shrine = CreateZoneShrine(game, layout.portalRoom, 2, types[index],
+            layout.actors[index + 1]);
+        if (!shrine.value("ok", false)) return shrine;
+        others.push_back(std::move(shrine));
+    }
+    json event = healing;
+    if (!runChestSettled[level][0]) {
+        json chest = CreateZoneChest(game, player, layout.actors[5], false, layout.portalRoom);
+        if (!chest.value("ok", false)) return chest;
+        runChestIds[level][0] = chest["object_id"].get<DWORD>();
+        event["chest"] = std::move(chest);
+    }
+    runShrineIds[level][0] = healing["object_id"].get<DWORD>();
+    for (unsigned i = 0; i < 4; ++i)
+        runShrineIds[level][i + 1] = others[i]["object_id"].get<DWORD>();
+    event["status"] = "shrines_spawned";
+    event["healing"] = std::move(healing);
+    event["other"] = others[0];
+    event["others"] = std::move(others);
+    return event;
+}
+
 json CompleteNonCombatZone(void* game, UnitAny* player, int level,
     const ZoneSlot& zone) {
     ServerMonsters::Request inspect;
@@ -5442,11 +5528,18 @@ json CompleteNonCombatZone(void* game, UnitAny* player, int level,
     RunLayout layout{};
     const unsigned actorCount =
         zone.kind == Pending::ZoneKind::Merchant ? 4u :
-        (zone.kind == Pending::ZoneKind::Shrine ||
-         zone.kind == Pending::ZoneKind::Chest ? 3u : 0u);
-    if (actorCount && !PlanRunLayout(
-            D2COMMON_GetRoomFromUnit(player), player, actorCount, layout,
-            zone.kind == Pending::ZoneKind::Chest)) {
+        zone.kind == Pending::ZoneKind::Shrine ? 6u :
+        zone.kind == Pending::ZoneKind::Chest ? 3u : 0u;
+    const bool planned = !actorCount || (zone.kind == Pending::ZoneKind::Shrine ?
+        PlanSanctuaryLayout(D2COMMON_GetRoomFromUnit(player), player, layout) :
+        PlanRunLayout(D2COMMON_GetRoomFromUnit(player), player, actorCount, layout,
+            zone.kind == Pending::ZoneKind::Chest));
+    if (!planned) {
+        if (zone.kind == Pending::ZoneKind::Shrine) {
+            runEncounters[level] = 3;
+            runError = "no reachable space for the complete sanctuary";
+            return Failure(runError);
+        }
         runEncounters[level] = kEncounterDegraded;
         runEncounterWarning = "no spacious, reachable event and choice layout";
         runCleared[level] = true; // No event object was created; the census already proved empty.
@@ -5485,48 +5578,12 @@ json CompleteNonCombatZone(void* game, UnitAny* player, int level,
             }
         }
     } else if (zone.kind == Pending::ZoneKind::Shrine) {
-        const json healing = CreateZoneShrine(game, player, 77, 1,
-            layout.actors[0]);
-        event = healing;
-        if (healing.value("ok", false)) {
-            json others = json::array();
-            for (unsigned index = 0; index < 2; ++index) {
-                const BYTE type = index == 0 ?
-                    zone.otherShrine : zone.secondOtherShrine;
-                json other = CreateZoneShrine(game, player, 2, type,
-                    layout.actors[index + 1]);
-                others.push_back(other);
-                if (!other.value("ok", false)) {
-                    event["ok"] = false;
-                    event["status"] = "partial_shrine_event";
-                    event["healing"] = healing;
-                    event["others"] = std::move(others);
-                    break;
-                }
-            }
-            if (event.value("ok", false)) {
-                event["status"] = "shrines_spawned";
-                event["healing"] = healing;
-                event["others"] = others;
-                event["other"] = others[0];
-            }
-        }
+        event = CreateSanctuaryEvent(game, player, level, zone, layout);
     }
     if (!event.value("ok", false)) {
         runEncounters[level] = 3;
         runError = "noncombat event creation uncertain";
         return event;
-    }
-    if (zone.kind == Pending::ZoneKind::Shrine) {
-        if (!event.contains("others") || !event["others"].is_array() ||
-            event["others"].size() != 2) {
-            runEncounters[level] = 3;
-            runError = "three-shrine identity ledger incomplete";
-            return Failure(runError);
-        }
-        runShrineIds[level] = {event["object_id"].get<DWORD>(),
-            event["others"][0]["object_id"].get<DWORD>(),
-            event["others"][1]["object_id"].get<DWORD>()};
     }
     if (zone.kind == Pending::ZoneKind::Chest) {
         if (event["chests"].size() != 3) {
@@ -7443,7 +7500,8 @@ void ContinueRunResume(void* game, UnitAny* player) {
         runCleared[destination] = cleared;
         runPopulationReady[destination] = combat && cleared;
         runEncounters[destination] = combat && cleared ? 2 : 0;
-        runChestSettled[destination] = zone.kind == Pending::ZoneKind::Chest ?
+        runChestSettled[destination] =
+            zone.kind == Pending::ZoneKind::Chest || zone.kind == Pending::ZoneKind::Shrine ?
             chestFound->second : std::array<bool, 3>{};
         runChestUniqueIds[destination] = uniqueIdsFound->second;
         runChestUniqueCounts[destination] = uniqueCountFound->second;
@@ -7492,6 +7550,93 @@ void ReportStart(void* game, UnitAny* player, const json& result) {
     BYTE message[128] = {0x15, 1, 0};
     memcpy(message + 3, text.data(), text.size());
     originalChat(game, player, message, static_cast<int>(text.size() + 4));
+}
+json DropSanctuaryElixir(void* game, UnitAny* player,
+    const RoguelikeAura::Config& aura, int playerLevel, DWORD seed) {
+    D2ItemDataTbl* bases = nullptr;
+    sgptDataTable* records = nullptr;
+    if (!RewardTables(bases, records)) return Failure("elixir item tables unavailable");
+    DWORD code = 0;
+    memcpy(&code, aura.itemCode, sizeof(code));
+    int baseId = -1;
+    const ItemsTxt* base = D2COMMON_GetItemTextFromItemCode(code, &baseId);
+    if (!base || baseId < 0 || baseId >= bases->nItemsTxtRecordCount ||
+        base != bases->pItemsTxt + baseId || base->dwcode != code)
+        return Failure("elixir item base unavailable");
+    Pending reward;
+    reward.id = "sanctuary-elixir";
+    reward.playerId = player->dwUnitId;
+    reward.level = playerLevel;
+    reward.quality = 2;
+    reward.seed = seed ? seed : 1;
+    reward.expectedEpoch = runEpoch;
+    reward.baseId = baseId;
+    const GroundItemResult generated = CreateGroundItem(
+        game, player, reward, nullptr, false, 0, false);
+    if (generated.error) {
+        json failure = Failure(generated.error);
+        if (generated.item)
+            failure["cleanup_uncertain"] = !RemoveRolledItem(game, player, generated.item);
+        return failure;
+    }
+    return {{"ok", true}, {"item_id", generated.item->dwUnitId}};
+}
+void DropSanctuaryChestRewards(void* game, UnitAny* player, int level, DWORD id) {
+    const int playerLevel = MarketCharacterLevel();
+    constexpr unsigned count = sizeof(RoguelikeAura::kElixirsOfAuras) /
+        sizeof(RoguelikeAura::kElixirsOfAuras[0]);
+    std::array<int, count> requirements{};
+    for (unsigned i = 0; i < count; ++i) {
+        const SkillsTxt* skill = RunAuraSkill(&RoguelikeAura::kElixirsOfAuras[i]);
+        if (!skill) {
+            ReportRunDropFailure(game, player, Failure("elixir skill table unavailable"));
+            return;
+        }
+        requirements[i] = skill->wReqLevel;
+    }
+    std::minstd_rand random(GetTickCount() ^ id ^ (level * 2654435761u));
+    const unsigned rewardCount = 1u + static_cast<unsigned>(random()) % 5u;
+    for (unsigned i = 0; i < rewardCount; ++i) {
+        const int selected = RoguelikeAura::SelectEligibleElixir(
+            playerLevel, static_cast<unsigned>(random()), requirements.data());
+        if (selected < 0) {
+            ReportRunDropFailure(game, player, Failure("no level-eligible elixir"));
+            return;
+        }
+        const json reward = DropSanctuaryElixir(game, player,
+            RoguelikeAura::kElixirsOfAuras[selected], playerLevel,
+            static_cast<DWORD>(random()));
+        if (!reward.value("ok", false)) {
+            ReportRunDropFailure(game, player, reward);
+            if (!runError.empty()) return;
+            continue;
+        }
+        runChestRewardIds[level][0][runChestRewardCounts[level][0]++] =
+            reward["item_id"].get<DWORD>();
+    }
+}
+void SettleSanctuaryChest(void* game, UnitAny* player, int level) {
+    if (!runCleared[level] || !runError.empty() ||
+        !ObservationTelemetry::MatchesContext(runEpoch, game, player) ||
+        runChestSettled[level][0]) return;
+    const DWORD id = runChestIds[level][0];
+    if (!id) return;
+    UnitAny* chest = FindServerObject(game, id, 397);
+    if (!chest || chest->dwTxtFileNo != 397 ||
+        !Readable(chest->pObjectData, sizeof(ObjectData)) ||
+        (chest->dwMode != OBJ_MODE_IDLE && chest->dwMode != OBJ_MODE_OPERATING &&
+         chest->dwMode != OBJ_MODE_OPENED)) {
+        runChestSettled[level][0] = true;
+        ++runDropFailureCount;
+        runDropError = "owned sanctuary chest identity or state changed";
+        return;
+    }
+    if (chest->dwMode != OBJ_MODE_OPENED) {
+        if (chest->dwMode == OBJ_MODE_IDLE) chest->pObjectData->ChestLocked = 0;
+        return;
+    }
+    runChestSettled[level][0] = true; // Never replay an uncertain reward.
+    DropSanctuaryChestRewards(game, player, level, id);
 }
 void SettleChestRewards(void* game, UnitAny* player, int level) {
     if (zoneSlots[level].kind != Pending::ZoneKind::Chest ||
@@ -7581,6 +7726,9 @@ void SettleRunAfterArrival(void* game, UnitAny* player) {
         if (level >= 13 && level <= 254 && zoneSlots[level].configured &&
             zoneSlots[level].kind == Pending::ZoneKind::Chest)
             SettleChestRewards(game, player, level);
+        if (level >= 13 && level <= 254 && zoneSlots[level].configured &&
+            zoneSlots[level].kind == Pending::ZoneKind::Shrine)
+            SettleSanctuaryChest(game, player, level);
         if (level >= 13 && level <= 254 &&
             (runBossKillWitness.load(std::memory_order_acquire) ||
              runClearRetry.load(std::memory_order_acquire)) &&
@@ -8855,6 +9003,34 @@ bool DropBossCorruptedUniques(void* game, UnitAny* player, UnitAny* boss,
     }
     return true;
 }
+// The 0x15 callback is the client-to-server chat receiver, not a sender.
+// Transfer the latest server census to the client frame's chat printer.
+std::atomic<std::uint64_t> remainingMonstersChat{0};
+void FlushRemainingMonstersChat() {
+    if (!runGame.load(std::memory_order_acquire) || !IsGameReady()) return;
+    std::uint64_t notice = remainingMonstersChat.load(std::memory_order_acquire);
+    if (!notice) return;
+    const int level = static_cast<int>(notice >> 32);
+    if (runStage.load(std::memory_order_acquire) != level) {
+        remainingMonstersChat.compare_exchange_strong(
+            notice, 0, std::memory_order_acq_rel);
+        return;
+    }
+    if (!PortalArea(D2CLIENT_GetPlayerUnit(), level)) return;
+    static const bool clientVerified = [] {
+        std::string error;
+        return LabProfile::VerifyClient(error);
+    }();
+    if (!clientVerified) return;
+    if (!remainingMonstersChat.compare_exchange_strong(
+            notice, 0, std::memory_order_acq_rel)) return;
+    const unsigned remaining = static_cast<unsigned>(notice) - 1;
+    wchar_t text[48];
+    if (std::swprintf(text, sizeof(text) / sizeof(text[0]),
+            remaining == 1 ? L"%u monster remains" : L"%u monsters remain",
+            remaining) > 0)
+        D2CLIENT_PrintGameString(text, 0);
+}
 void ReportRemainingMonsters(void* game, int level, UnitAny* defender) {
     if (!runPopulationReady[level] || !Readable(defender->pMonsterData, sizeof(*defender->pMonsterData)) ||
         !Readable(defender->pMonsterData->pMonStatsTxt, sizeof(MonStatsTxt))) return;
@@ -8864,11 +9040,8 @@ void ReportRemainingMonsters(void* game, int level, UnitAny* defender) {
     unsigned remaining = 0;
     if (ServerMonsters::QueryRoomClear(game, runPlayer, level, &remaining) ==
         ServerMonsters::RoomClearState::Unavailable) return;
-    BYTE message[48] = {0x15, 1, 0};
-    const int length = std::snprintf(reinterpret_cast<char*>(message + 3), sizeof(message) - 3,
-        remaining == 1 ? "%u monster remains" : "%u monsters remain", remaining);
-    if (length > 0 && static_cast<size_t>(length) < sizeof(message) - 3)
-        originalChat(game, runPlayer, message, length + 4);
+    remainingMonstersChat.store((std::uint64_t(level) << 32) |
+        (std::uint64_t(remaining) + 1), std::memory_order_release);
 }
 
 void OnNaturalKill(void* game, UnitAny* defender) {
@@ -9047,8 +9220,10 @@ void RequestRunAuraPulse() {
 }
 void RequestAutomaticEntrance() {
     if (autoEntrance.load(std::memory_order_acquire) != AutoEntrance::Waiting ||
-        !hookPairReady.load(std::memory_order_acquire) || !IsGameReady() ||
-        !PortalArea(D2CLIENT_GetPlayerUnit(), 1)) return;
+        !hookPairReady.load(std::memory_order_acquire) || !IsGameReady()) return;
+    UnitAny* player = D2CLIENT_GetPlayerUnit();
+    if (!PortalArea(player, 1) || player->dwMode == PLAYER_MODE_DEATH ||
+        player->dwMode == PLAYER_MODE_DEAD) return;
     const auto* client = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2Client.dll"));
     if (!client) return;
     // Pinned 1.13c client startup: check the absolute mode load and its zero branch.
@@ -9074,6 +9249,7 @@ void RequestAutomaticEntrance() {
 void SettleRunFrame() {
     RequestAutomaticEntrance();
     HandleRunDeath();
+    FlushRemainingMonstersChat();
     RequestRunAuraPulse();
     const int level = runStage.load(std::memory_order_acquire);
     if (runResume.active) {
@@ -9104,10 +9280,12 @@ void SettleRunFrame() {
     }
     const bool chestPending = level >= 13 && level <= 254 &&
         zoneSlots[level].configured &&
-        zoneSlots[level].kind == Pending::ZoneKind::Chest &&
         runError.empty() &&
-        (!runChestSettled[level][0] || !runChestSettled[level][1] ||
-         !runChestSettled[level][2]);
+        ((zoneSlots[level].kind == Pending::ZoneKind::Chest &&
+          (!runChestSettled[level][0] || !runChestSettled[level][1] ||
+           !runChestSettled[level][2])) ||
+         (zoneSlots[level].kind == Pending::ZoneKind::Shrine &&
+          !runChestSettled[level][0]));
     const bool placementPending = runChoicePlacementPending.load(std::memory_order_acquire);
     const bool clearPending = runClearRetry.load(std::memory_order_acquire);
     if (!game || level < 13 || level > 254 || !PortalArea(player, level)) return;
@@ -9167,6 +9345,7 @@ void RestoreRoguelikeZones(bool saveSnapshot) {
         lastRunSnapshotStatus = std::move(snapshotStatus);
     }
     runGame.store(nullptr, std::memory_order_release);
+    remainingMonstersChat.store(0, std::memory_order_release);
     runDeathHandled.store(false, std::memory_order_release);
     runStarterSettled.store(false, std::memory_order_release);
     runBossKillWitness.store(false, std::memory_order_release);
@@ -9260,6 +9439,8 @@ void HandleRunDeath() {
         OutputDebugStringA(("Roguelike death portal cleanup uncertain: " +
             portalCleanup.dump() + "\n").c_str());
     RestoreRoguelikeZones(false);
+    if (reset && portalCleanup.value("ok", false))
+        autoEntrance.store(AutoEntrance::Waiting, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(mutex);
         lastRunSnapshotStatus["death_reset"] = reset;
@@ -9971,7 +10152,8 @@ json InteractRoguelikeChest(const json& args) {
         !Readable(runPlayer, sizeof(UnitAny)) ||
         runPlayer->dwUnitId != player->dwUnitId || runEpoch != epoch ||
         runStage.load(std::memory_order_acquire) != from ||
-        zoneSlots[from].kind != Pending::ZoneKind::Chest ||
+        (zoneSlots[from].kind != Pending::ZoneKind::Chest &&
+         zoneSlots[from].kind != Pending::ZoneKind::Shrine) ||
         !runCleared[from] || !runError.empty() ||
         std::find(runChestIds[from].begin(), runChestIds[from].end(),
             static_cast<DWORD>(objectId)) == runChestIds[from].end())
@@ -9980,14 +10162,15 @@ json InteractRoguelikeChest(const json& args) {
     if (!object || object->dwType != UNIT_OBJECT || object->dwUnitId != objectId ||
         object->dwTxtFileNo != 397 || object->dwMode != 0 ||
         !Readable(object->pObjectData, sizeof(ObjectData)) ||
-        !object->pObjectData->ChestLocked ||
+        bool(object->pObjectData->ChestLocked) !=
+            (zoneSlots[from].kind == Pending::ZoneKind::Chest) ||
         !Readable(object->pObjectPath, sizeof(ObjectPath)) ||
         !Readable(object->pObjectPath->pRoom1, sizeof(Room1)) ||
         !Readable(object->pObjectPath->pRoom1->pRoom2, sizeof(Room2)) ||
         !Readable(object->pObjectPath->pRoom1->pRoom2->pLevel, sizeof(Level)) ||
         object->pObjectPath->pRoom1->pRoom2->pLevel->dwLevelNo != from ||
         D2COMMON_GetUnitDistance(player, object) >= 9)
-        return Failure("stock locked chest is absent or out of reach");
+        return Failure("owned chest is absent, has an unexpected lock state, or is out of reach");
     json receipt = {{"ok", false}, {"status", "unconfirmed"},
         {"request_id", id}, {"object_id", objectId}};
     if (!ReservePortalNonce(id, fingerprint, receipt))

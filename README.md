@@ -10,9 +10,12 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 
 - After a combat clear, pick from up to three one-way portals. Combat portal labels show the encounter, area level, modifiers, and reward.
 - Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
-- Visit markets for supplies and hirelings, sanctuaries for shrines, and treasure rooms for locked chests.
+- Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests.
 - Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms.
 - Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
+- The number of monsters remaining appears in chat after a kill.
+
+Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs; the available auras expand as your character gains levels.
 
 Softcore death ends the run and resets character progression to level one. Normal corpse and gold penalties still apply. The current pool of areas is finite.
 
@@ -68,7 +71,7 @@ Windows may warn about the launcher because it is unsigned. If you have an older
 
 Use **Save and Exit** to pause a run. Load the same character in a new Single Player game and click **Return to the Abyss**. An interrupted area starts over, and items left on the ground are not saved.
 
-After a Softcore death, type `run start` in game chat to open a new entrance in the same game. Close the game completely before using the launcher again.
+After a Softcore death, return to town and a new entrance opens automatically. Close the game completely before using the launcher again.
 
 ## Updates and troubleshooting
 

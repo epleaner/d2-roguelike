@@ -54,6 +54,23 @@ constexpr bool ValidCatalog() {
 static_assert(ValidCatalog(), "Aura elixirs must be unique level-30, 30-second configurations");
 
 
+// requirements mirrors kElixirsOfAuras and contains each skill's required character level.
+inline int SelectEligibleElixir(int playerLevel, unsigned roll, const int* requirements) noexcept {
+    if (!requirements || playerLevel < 1 || playerLevel > 99) return -1;
+    constexpr int count = sizeof(kElixirsOfAuras) / sizeof(kElixirsOfAuras[0]);
+    int eligible = 0;
+    for (int index = 0; index < count; ++index) {
+        const int requiredLevel = requirements[index];
+        if (requiredLevel < 1 || requiredLevel > 99) return -1;
+        if (requiredLevel <= playerLevel) ++eligible;
+    }
+    if (!eligible) return -1;
+    unsigned position = roll % static_cast<unsigned>(eligible);
+    for (int index = 0; index < count; ++index)
+        if (requirements[index] <= playerLevel && position-- == 0) return index;
+    return -1;
+}
+
 inline const Config* FindByCode(const char code[4]) {
     if (!code || (code[3] != ' ' && code[3] != '\0')) return nullptr;
     for (const Config& aura : kElixirsOfAuras)

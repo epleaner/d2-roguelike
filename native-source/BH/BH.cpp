@@ -12,7 +12,6 @@
 
 #include <cstring>
 #include <cstdint>
-#include <cwchar>
 
 string BH::path;
 HINSTANCE BH::instance = nullptr;
