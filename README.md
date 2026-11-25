@@ -1,26 +1,42 @@
 # PD2 Roguelike
 
-An experimental **single-player** Roguelike mod for classic Diablo II: Lord of Destruction and Project Diablo 2. This is not a Diablo II: Resurrected mod.
+An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear compact areas, and choose where to go next. Build your character as you descend; the route, enemies, and rewards change from run to run.
 
-> **Compatibility:** v0.8.0 requires the exact **Project Diablo 2 Season 14 Patch #2** game archives (plus the matching classic Diablo II: Lord of Destruction files). It does not install, downgrade, or adapt other PD2 patches. The previous launcher cannot update itself: download the latest **PD2-Roguelike.exe** separately.
->
-> **Offline only:** The mod does not block PD2 Online. Connecting online with the mod installed may put your PD2 account at risk. Use a separate game copy and choose Single Player.
+**Requires Windows, classic Diablo II: Lord of Destruction, and Project Diablo 2 Season 14 Patch #2.** This is not a Diablo II: Resurrected mod.
 
-## Install v0.8.0 (S14 Patch #2)
+**Single Player only.** The mod does not block PD2 Online, and connecting with it installed may put your account at risk.
 
-1. On Windows, prepare an installed classic Diablo II: Lord of Destruction game with **PD2 Season 14 Patch #2**. You need your own game files; they are not included in this download. Other patches or game archive versions are not supported.
-2. Close the game and make a separate copy of the entire Diablo II folder, including its `ProjectD2` folder. The launcher modifies the folder you select; don't select your original if you want to keep it unchanged.
-3. Download the latest **PD2-Roguelike.exe** from [the latest release](https://github.com/epleaner/d2-roguelike/releases/latest) and place it in the copied Diablo II folder (the folder containing `ProjectD2`). An older launcher does not update itself and cannot install this release.
-4. Run the new launcher, select the copied folder if needed, and choose **Play**. The first installation requires an internet connection. The executable is unsigned, so Windows may display a reputation warning.
-5. Choose **Single Player**. In town, click **Enter the Abyss** to start a run; the entrance appears automatically.
+## The run
 
-To resume a saved run, load the same character in another Single Player game and click **Return to the Abyss** at the automatically opened entrance. An uncleared room must be fought again. If you die and return to town in the same game, type `run start` in game chat to open another entrance. Close the game completely before choosing Play again. Character saves and route snapshots are preserved across mod updates.
+- After a combat clear, pick from up to three one-way portals. Combat portal labels show the encounter, area level, modifiers, and reward.
+- Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
+- Visit markets for supplies and hirelings, sanctuaries for shrines, and treasure rooms for locked chests.
+- Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms.
+- Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
+
+Softcore death ends the run and resets character progression to level one. Normal corpse and gold penalties still apply. The current pool of areas is finite.
+
+## Install
+
+1. Install classic Diablo II: Lord of Destruction and **Project Diablo 2 Season 14 Patch #2** on Windows. Other PD2 patches and Diablo II: Resurrected are not supported.
+2. Close the game. Make a copy of the entire Diablo II folder, including `ProjectD2`. The launcher modifies the folder you select, so use the copy if you want to keep your original installation unchanged.
+3. Download **[PD2-Roguelike.exe](https://github.com/epleaner/d2-roguelike/releases/latest)** from the latest release and put it in the copied Diablo II folder, alongside `ProjectD2`.
+4. Run the launcher and select the copied folder if it isn't already selected. Click **Play**. The first install needs an internet connection.
+5. Choose **Single Player**. The entrance appears automatically in town. Click **Enter the Abyss** to begin.
+
+Windows may warn about the launcher because it is unsigned. If you have an older Roguelike launcher, download the new executable; it cannot update itself.
+
+## Save and resume
+
+Use **Save and Exit** to pause a run. Load the same character in a new Single Player game and click **Return to the Abyss**. An interrupted area starts over, and items left on the ground are not saved.
+
+After a Softcore death, type `run start` in game chat to open a new entrance in the same game. Close the game completely before using the launcher again.
 
 ## Updates and troubleshooting
 
-The launcher checks GitHub for the latest mod release when you choose Play. If the update service is unavailable, it reports the error and can start a valid existing installation; a first installation still needs a connection. New launcher executables must be downloaded separately; the previous launcher cannot update itself to v0.8.0.
+The launcher checks for mod updates when you click **Play**. If the update service is unavailable, it reports the error and can still launch a valid existing installation. Updates preserve character saves and route snapshots.
 
-The launcher verifies exact game files and rejects unsupported archives, including other PD2 patches. Use a short installation path with ASCII characters only.
+The launcher checks the game files against the supported version. If it rejects your installation, check that it is S14 Patch #2 and that you selected the full Diablo II folder, not just `ProjectD2`. Use a short path containing only ASCII characters.
 
 ## Source and notices
 
