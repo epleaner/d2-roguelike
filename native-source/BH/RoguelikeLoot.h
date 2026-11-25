@@ -9,6 +9,12 @@ constexpr std::uint32_t kBasisPoints = 10000;
 constexpr std::uint32_t kDropFlagNeverEthereal = 0x02;
 constexpr std::uint32_t kDropFlagNoSockets = 0x08;
 constexpr std::uint32_t kDropFlagAlwaysSockets = 0x10;
+// Roll once for each otherwise-generated combat item; bosses keep every item.
+constexpr bool KeepCombatDrop(bool designatedBoss, std::uint32_t roll,
+    int quality = 2) noexcept {
+    return designatedBoss || roll <
+        ((quality == 5 || quality == 7) ? 5000u : 7500u);
+}
 constexpr bool EarlyMagicRoll(int characterLevel, std::uint32_t roll,
     unsigned whiteRange = kBasisPoints) noexcept {
     return characterLevel >= 1 && characterLevel < 20 &&
@@ -73,12 +79,12 @@ constexpr int kChestUniqueSearchBonus = 12;
 constexpr unsigned ChestRewardCount(std::uint32_t roll) noexcept {
     return 2u + roll % 3u;
 }
-constexpr unsigned kSanctuaryPotionsPerType = 10;
-constexpr unsigned kMaximumChestRewardIds =
-    5 + 2 * kSanctuaryPotionsPerType;
-constexpr unsigned SanctuaryPotionTier(int playerLevel) noexcept {
-    const int tier = playerLevel < 1 ? 0 : playerLevel / 10;
-    return static_cast<unsigned>(tier >= 4 ? 5 : tier + 1);
+constexpr unsigned kSanctuaryRejuvenations = 20;
+constexpr unsigned kMaximumChestRewardIds = 5 + kSanctuaryRejuvenations;
+constexpr bool SanctuaryFullRejuvenation(int playerLevel,
+    std::uint32_t roll) noexcept {
+    return playerLevel >= 40 ||
+        (playerLevel > 1 && roll % 39u < static_cast<unsigned>(playerLevel - 1));
 }
 constexpr unsigned BossCorruptedUniqueCount() noexcept { return 3; }
 constexpr bool ChestNaturalDropAllowed(int quality, bool potion) noexcept {

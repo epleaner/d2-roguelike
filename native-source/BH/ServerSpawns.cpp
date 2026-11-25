@@ -2009,6 +2009,10 @@ bool RoguelikeMonsterDropContext(void* game, Drop* drop, int& area) {
         (zoneSlots[area].kind == Pending::ZoneKind::Monster ||
          zoneSlots[area].kind == Pending::ZoneKind::Boss);
 }
+bool DesignatedBossDrop(int area, const UnitAny* monster) {
+    return monster && runBossUnit[area] &&
+        monster->dwUnitId == runBossUnit[area];
+}
 bool RoguelikeOwnedChestDropContext(void* game, Drop* drop, int& area) {
     if (!game || game != runGame.load(std::memory_order_acquire) ||
         !Readable(drop, sizeof(Drop)) || drop->game != game ||
@@ -2078,6 +2082,21 @@ int RunEquipmentQuality(int quality, int playerLevel, DWORD seed, bool firstZone
     return quality == 2 && RoguelikeLoot::EarlyMagicRoll(
         playerLevel, EquipmentQualityRoll(seed)) ? 4 : quality;
 }
+bool RetainCombatItem(std::minstd_rand* random, int quality) {
+    return !random || RoguelikeLoot::KeepCombatDrop(false,
+        static_cast<unsigned>((*random)()) % RoguelikeLoot::kBasisPoints,
+        quality);
+}
+UnitAny* NativeCombatDrop(void* game, Drop* drop, int flags, bool designatedBoss,
+    bool* omitted = nullptr) {
+    static thread_local std::minstd_rand random(
+        GetTickCount() ^ GetCurrentThreadId());
+    if (!RetainCombatItem(designatedBoss ? nullptr : &random, drop->quality)) {
+        if (omitted) *omitted = true;
+        return nullptr;
+    }
+    return originalNaturalDrop(game, drop, flags);
+}
 UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
     int chestArea = 0;
     if (RoguelikeOwnedChestDropContext(game, drop, chestArea)) {
@@ -2111,7 +2130,8 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
         drop->baseId < 0 ||
         drop->baseId >= bases->nWeaponsTxtRecordCount +
             bases->nArmorTxtRecordCount)
-        return originalNaturalDrop(game, drop, flags);
+        return NativeCombatDrop(game, drop, flags,
+            DesignatedBossDrop(area, drop->unit));
     ++naturalEquipmentCalls;
     naturalEquipmentQuality = drop->quality;
     naturalEquipmentBase = drop->baseId;
@@ -2121,14 +2141,17 @@ UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
     int quality = RunEquipmentQuality(baseQuality, MarketCharacterLevel(), drop->seed, firstZone);
     if ((firstZone || quality != baseQuality) &&
         !RewardQualityAllowed(bases, records, drop->baseId, quality)) {
-        if (firstZone) return originalNaturalDrop(game, drop, flags);
+        if (firstZone) return NativeCombatDrop(game, drop, flags,
+            DesignatedBossDrop(area, drop->unit));
         quality = baseQuality;
     }
     ++naturalEquipmentForced;
     drop->quality = quality;
-    UnitAny* item = originalNaturalDrop(game, drop, flags);
+    bool omitted = false;
+    UnitAny* item = NativeCombatDrop(game, drop, flags,
+        DesignatedBossDrop(area, drop->unit), &omitted);
     if (!item) {
-        ++naturalEquipmentRejected;
+        if (!omitted) ++naturalEquipmentRejected;
         return nullptr;
     }
     return item;
@@ -2154,11 +2177,13 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
     int charmSize = 0, bool corruptedUnique = false,
     int uniqueLevelBonus = 0, const int* excludedUniqueIds = nullptr,
     unsigned excludedUniqueCount = 0, bool includeDiagnostics = false,
-    bool dedicatedReward = false) {
+    bool dedicatedReward = false, std::minstd_rand* combatRandom = nullptr) {
     if (sockets < 0 || sockets > 3)
         return Failure("requested socket count is outside the supported range");
     if (corruptedUnique && quality != 7)
         return Failure("boss corruption requires a unique item");
+    if (dedicatedReward && !RetainCombatItem(combatRandom, quality))
+        return {{"ok", true}, {"omitted", true}};
     Pending reward;
     int maximumSockets = 0;
     reward.id = "run-reward";
@@ -2172,6 +2197,8 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
             baseKind, charmSize, &maximumSockets, uniqueLevelBonus,
             excludedUniqueIds, excludedUniqueCount, dedicatedReward))
         return Failure("no compiled level-eligible reward base and quality");
+    if (!dedicatedReward && !RetainCombatItem(combatRandom, reward.quality))
+        return {{"ok", true}, {"omitted", true}};
     WssCorruptionSelection corruption{};
     std::string corruptionError;
     const DWORD socketSeed = sockets ?
@@ -2349,7 +2376,8 @@ int SelectMaterialBase(D2ItemDataTbl* bases, int itemLevel, int playerLevel,
     return -1;
 }
 json DropRunMaterial(void* game, UnitAny* player, int itemLevel, int playerLevel,
-    RunMaterial kind, DWORD entropy, UnitAny* dropper = nullptr) {
+    RunMaterial kind, DWORD entropy, UnitAny* dropper = nullptr,
+    std::minstd_rand* combatRandom = nullptr) {
     D2ItemDataTbl* bases = nullptr;
     sgptDataTable* records = nullptr;
     if (!RewardTables(bases, records))
@@ -2357,6 +2385,8 @@ json DropRunMaterial(void* game, UnitAny* player, int itemLevel, int playerLevel
     const int base = SelectMaterialBase(
         bases, itemLevel, playerLevel, kind, entropy);
     if (base < 0) return Failure("no compiled level-eligible gem or rune");
+    if (!RetainCombatItem(combatRandom, 2))
+        return {{"ok", true}, {"omitted", true}};
     Pending reward;
     reward.id = "run-material";
     reward.playerId = player->dwUnitId;
@@ -2385,7 +2415,7 @@ int MonsterDropQuality(int itemLevel, int playerLevel, DWORD entropy) {
 }
 json DropRunCategory(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int playerLevel, RoguelikeLoot::BaseKind kind,
-    DWORD entropy, int charmSize = 0) {
+    DWORD entropy, int charmSize = 0, std::minstd_rand* combatRandom = nullptr) {
     const DWORD qualitySeed = entropy ^ 0xa511e9b3u;
     const DWORD baseSeed = entropy ^ 0x63d83595u;
     int quality = MonsterDropQuality(itemLevel, playerLevel, qualitySeed);
@@ -2396,7 +2426,8 @@ json DropRunCategory(void* game, UnitAny* player, UnitAny* monster,
             RoguelikeLoot::CharmSizeForRewardIndex(entropy));
     const auto spawn = [&](int itemQuality, int selectedCharmSize) {
         return DropRunReward(game, player, itemLevel, playerLevel,
-            itemQuality, false, baseSeed, 0, monster, kind, selectedCharmSize);
+            itemQuality, false, baseSeed, 0, monster, kind, selectedCharmSize,
+            false, 0, nullptr, 0, false, false, combatRandom);
     };
     const auto noEligibleRewardBase = [](const json& drop) {
         return !drop.value("ok", false) &&
@@ -2409,69 +2440,79 @@ json DropRunCategory(void* game, UnitAny* player, UnitAny* monster,
     return result;
 }
 json DropRunJewel(void* game, UnitAny* player, UnitAny* monster,
-    int itemLevel, int playerLevel, DWORD entropy) {
+    int itemLevel, int playerLevel, DWORD entropy,
+    std::minstd_rand* combatRandom = nullptr) {
     return DropRunCategory(game, player, monster, itemLevel, playerLevel,
-        RoguelikeLoot::BaseKind::Jewel, entropy);
+        RoguelikeLoot::BaseKind::Jewel, entropy, 0, combatRandom);
 }
 json DropRunSocketable(void* game, UnitAny* player, UnitAny* monster,
-    int itemLevel, int playerLevel, unsigned materialSlot, DWORD entropy) {
+    int itemLevel, int playerLevel, unsigned materialSlot, DWORD entropy,
+    std::minstd_rand* combatRandom = nullptr) {
     switch (materialSlot % 3u) {
     case 0:
         return DropRunMaterial(game, player, itemLevel, playerLevel,
-            RunMaterial::Gem, entropy, monster);
+            RunMaterial::Gem, entropy, monster, combatRandom);
     case 1:
         return DropRunMaterial(game, player, itemLevel, playerLevel,
-            RunMaterial::Rune, entropy, monster);
+            RunMaterial::Rune, entropy, monster, combatRandom);
     default:
-        return DropRunJewel(game, player, monster, itemLevel, playerLevel, entropy);
+        return DropRunJewel(game, player, monster, itemLevel, playerLevel,
+            entropy, combatRandom);
     }
 }
 json DropMonsterItem(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int playerLevel, RoguelikeLoot::DropKind kind,
-    DWORD entropy, unsigned materialSlot) {
+    DWORD entropy, unsigned materialSlot, std::minstd_rand* combatRandom) {
     switch (kind) {
     case RoguelikeLoot::DropKind::Equipment: {
         const bool firstZone = runRootLevel == runStage.load(std::memory_order_acquire);
         const int quality = firstZone ? 4 :
             MonsterDropQuality(playerLevel, playerLevel, entropy ^ 0xa511e9b3u);
         json reward = DropRunReward(game, player, itemLevel, playerLevel,
-            quality, firstZone, entropy, 0, monster);
+            quality, firstZone, entropy, 0, monster,
+            RoguelikeLoot::BaseKind::Equipment, 0, false, 0, nullptr, 0,
+            false, false, combatRandom);
         if (!reward.value("ok", false) && (quality == 5 || quality == 7) &&
             reward.value("error", "") ==
                 "no compiled level-eligible reward base and quality")
             reward = DropRunReward(game, player, itemLevel, playerLevel,
-                6, false, entropy, 0, monster);
+                6, false, entropy, 0, monster,
+                RoguelikeLoot::BaseKind::Equipment, 0, false, 0, nullptr, 0,
+                false, false, combatRandom);
         return reward;
     }
     case RoguelikeLoot::DropKind::SocketedEquipment:
         return DropRunReward(game, player, itemLevel, playerLevel,
-            2, false, entropy, 1, monster);
+            2, false, entropy, 1, monster,
+            RoguelikeLoot::BaseKind::Equipment, 0, false, 0, nullptr, 0,
+            false, false, combatRandom);
     case RoguelikeLoot::DropKind::Gem:
         return DropRunMaterial(game, player, itemLevel, playerLevel,
-            RunMaterial::Gem, entropy, monster);
+            RunMaterial::Gem, entropy, monster, combatRandom);
     case RoguelikeLoot::DropKind::Rune:
         return DropRunMaterial(game, player, itemLevel, playerLevel,
-            RunMaterial::Rune, entropy, monster);
+            RunMaterial::Rune, entropy, monster, combatRandom);
     case RoguelikeLoot::DropKind::Socketable:
         return DropRunSocketable(game, player, monster, itemLevel, playerLevel,
-            materialSlot, entropy);
+            materialSlot, entropy, combatRandom);
     case RoguelikeLoot::DropKind::Jewelry:
         return DropRunCategory(game, player, monster, itemLevel, playerLevel,
-            RoguelikeLoot::BaseKind::Jewelry, entropy);
+            RoguelikeLoot::BaseKind::Jewelry, entropy, 0, combatRandom);
     case RoguelikeLoot::DropKind::Charms:
         return DropRunCategory(game, player, monster, itemLevel, playerLevel,
             RoguelikeLoot::BaseKind::Charm, entropy,
-            static_cast<int>(RoguelikeLoot::CharmSizeForRewardIndex(materialSlot)));
+            static_cast<int>(RoguelikeLoot::CharmSizeForRewardIndex(materialSlot)),
+            combatRandom);
     case RoguelikeLoot::DropKind::Unique:
         return DropRunReward(game, player,
             RoguelikeLoot::SpecialRewardItemLevel(itemLevel), playerLevel,
             7, false, entropy, 0, monster, RoguelikeLoot::BaseKind::Equipment,
-            0, false, 0, nullptr, 0, false, true);
+            0, false, 0, nullptr, 0, false, true, combatRandom);
     case RoguelikeLoot::DropKind::Set:
         return DropRunReward(game, player,
             RoguelikeLoot::SpecialRewardItemLevel(itemLevel), playerLevel,
             5, false, entropy, 0, monster, RoguelikeLoot::BaseKind::Equipment,
-            0, false, 0, nullptr, 0, false, true);
+            0, false, 0, nullptr, 0, false, true, combatRandom);
     case RoguelikeLoot::DropKind::None:
         break;
     }
@@ -2479,14 +2520,15 @@ json DropMonsterItem(void* game, UnitAny* player, UnitAny* monster,
 }
 bool DropMonsterGroup(void* game, UnitAny* player, UnitAny* monster,
     int itemLevel, int playerLevel, RoguelikeLoot::DropGroup group,
-    unsigned firstIndex, std::minstd_rand& random) {
+    unsigned firstIndex, std::minstd_rand* combatRandom,
+    std::minstd_rand& random) {
     for (unsigned index = 0; index < group.count; ++index) {
         const unsigned materialSlot = firstIndex + index;
         const DWORD entropy = static_cast<DWORD>(random()) ^
             monster->dwUnitId ^ (materialSlot * 2246822519u);
         const json reward = DropMonsterItem(
             game, player, monster, itemLevel, playerLevel, group.kind,
-            entropy, materialSlot);
+            entropy, materialSlot, combatRandom);
         if (!reward.value("ok", false)) {
             ReportRunDropFailure(game, player, reward);
             return false;
@@ -2495,7 +2537,7 @@ bool DropMonsterGroup(void* game, UnitAny* player, UnitAny* monster,
     return true;
 }
 bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
-    int itemLevel, int runDepth, Pending::RewardFocus focus) {
+    int itemLevel, int runDepth, Pending::RewardFocus focus, bool designatedBoss) {
     const int playerLevel = MarketCharacterLevel();
     if (playerLevel < 1 || playerLevel > 99) {
         ReportRunDropFailure(game, player, Failure("monster loot has no valid character level"));
@@ -2509,10 +2551,11 @@ bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
                 RoguelikeLoot::kBasisPoints));
     const RoguelikeLoot::MonsterDropPlan plan =
         RoguelikeLoot::PlanMonsterDrops(focus, primaryCount);
+    std::minstd_rand* combatRandom = designatedBoss ? nullptr : &random;
     if (!DropMonsterGroup(game, player, monster, itemLevel, playerLevel,
-            plan.primary, 0, random) ||
+            plan.primary, 0, combatRandom, random) ||
         !DropMonsterGroup(game, player, monster, itemLevel, playerLevel,
-            plan.secondary, plan.primary.count, random))
+            plan.secondary, plan.primary.count, combatRandom, random))
         return false;
     if (focus == Pending::RewardFocus::Equipment &&
         RoguelikeLoot::DropsRune(playerLevel,
@@ -2520,7 +2563,7 @@ bool DropMonsterLoot(void* game, UnitAny* player, UnitAny* monster,
         const DWORD entropy = static_cast<DWORD>(random()) ^
             monster->dwUnitId ^ 0x9e3779b9u;
         const json rune = DropRunMaterial(game, player, itemLevel, playerLevel,
-            RunMaterial::Rune, entropy, monster);
+            RunMaterial::Rune, entropy, monster, combatRandom);
         if (!rune.value("ok", false)) {
             if (rune.value("error", "") ==
                 "no compiled level-eligible gem or rune")
@@ -7697,17 +7740,16 @@ json DropSanctuaryElixir(void* game, UnitAny* player,
         return Failure("elixir item base unavailable");
     return DropSanctuaryItem(game, player, baseId, playerLevel, seed);
 }
-int SanctuaryPotionBase(bool mana, unsigned tier) {
+int SanctuaryPotionBase(bool full) {
     D2ItemDataTbl* bases = nullptr;
     sgptDataTable* records = nullptr;
-    if (!RewardTables(bases, records) || tier < 1 || tier > 5) return -1;
+    if (!RewardTables(bases, records)) return -1;
     for (int baseId = 0; baseId < bases->nItemsTxtRecordCount; ++baseId) {
         const ItemsTxt& row = bases->pItemsTxt[baseId];
-        if (row.szCode[0] == (mana ? 'm' : 'h') &&
-            row.szCode[1] == 'p' && row.szCode[2] == '0' + tier &&
+        if (row.szCode[0] == 'r' && row.szCode[1] == 'v' &&
+            row.szCode[2] == (full ? 'l' : 's') &&
             (row.szCode[3] == '\0' || row.szCode[3] == ' ') &&
-            row.bspawnable && !row.bquest &&
-            RewardBaseIsPotion(bases, records, baseId))
+            !row.bquest && RewardBaseIsPotion(bases, records, baseId))
             return baseId;
     }
     return -1;
@@ -7749,25 +7791,24 @@ void DropSanctuaryChestRewards(void* game, UnitAny* player, int level, DWORD id)
         runChestRewardIds[level][0][runChestRewardCounts[level][0]++] =
             reward["item_id"].get<DWORD>();
     }
-    const unsigned tier = RoguelikeLoot::SanctuaryPotionTier(playerLevel);
-    const int healthBase = SanctuaryPotionBase(false, tier);
-    const int manaBase = SanctuaryPotionBase(true, tier);
-    if (healthBase < 0 || manaBase < 0) {
-        ReportRunDropFailure(game, player, Failure("compiled health or mana potion tier unavailable"));
+    const int regularBase = SanctuaryPotionBase(false);
+    const int fullBase = SanctuaryPotionBase(true);
+    if (regularBase < 0 || fullBase < 0) {
+        ReportRunDropFailure(game, player, Failure("compiled rejuvenation potion bases unavailable"));
         return;
     }
-    for (const int base : {healthBase, manaBase}) {
-        for (unsigned i = 0; i < RoguelikeLoot::kSanctuaryPotionsPerType; ++i) {
-            const json reward = DropSanctuaryItem(game, player, base,
-                playerLevel, static_cast<DWORD>(random()));
-            if (!reward.value("ok", false)) {
-                ReportRunDropFailure(game, player, reward);
-                if (!runError.empty()) return;
-                continue;
-            }
-            runChestRewardIds[level][0][runChestRewardCounts[level][0]++] =
-                reward["item_id"].get<DWORD>();
+    for (unsigned i = 0; i < RoguelikeLoot::kSanctuaryRejuvenations; ++i) {
+        const int base = RoguelikeLoot::SanctuaryFullRejuvenation(
+            playerLevel, static_cast<DWORD>(random())) ? fullBase : regularBase;
+        const json reward = DropSanctuaryItem(game, player, base,
+            playerLevel, static_cast<DWORD>(random()));
+        if (!reward.value("ok", false)) {
+            ReportRunDropFailure(game, player, reward);
+            if (!runError.empty()) return;
+            continue;
         }
+        runChestRewardIds[level][0][runChestRewardCounts[level][0]++] =
+            reward["item_id"].get<DWORD>();
     }
 }
 void SettleSanctuaryChest(void* game, UnitAny* player, int level) {
@@ -9275,7 +9316,8 @@ void OnNaturalKill(void* game, UnitAny* defender) {
         return;
     }
     DropMonsterLoot(game, runPlayer, defender, itemLevel,
-        zoneSlots[level].depth, zoneSlots[level].reward);
+        zoneSlots[level].depth, zoneSlots[level].reward,
+        DesignatedBossDrop(level, defender));
     if (!runError.empty()) return;
     if (BossZone(zoneSlots[level].kind) &&
         defender->dwUnitId == runBossUnit[level] &&
@@ -9286,13 +9328,13 @@ void OnNaturalKill(void* game, UnitAny* defender) {
 }
 json DropFocusedClearPrimary(void* game, UnitAny* player, int itemLevel,
     int playerLevel, const ZoneSlot& zone, Pending::RewardFocus focus,
-    DWORD seed) {
+    DWORD seed, std::minstd_rand* combatRandom) {
     if (focus == Pending::RewardFocus::Jewelry)
         return DropRunCategory(game, player, nullptr, itemLevel, playerLevel,
-            RoguelikeLoot::BaseKind::Jewelry, seed);
+            RoguelikeLoot::BaseKind::Jewelry, seed, 0, combatRandom);
     if (focus == Pending::RewardFocus::Charms)
         return DropRunCategory(game, player, nullptr, itemLevel, playerLevel,
-            RoguelikeLoot::BaseKind::Charm, seed);
+            RoguelikeLoot::BaseKind::Charm, seed, 0, combatRandom);
     const bool sockets = focus == Pending::RewardFocus::Socketables;
     const int quality = focus == Pending::RewardFocus::Unique ? 7 :
         focus == Pending::RewardFocus::Set ? 5 :
@@ -9308,7 +9350,7 @@ json DropFocusedClearPrimary(void* game, UnitAny* player, int itemLevel,
         playerLevel, quality,
         zone.depth == 1 && focus == Pending::RewardFocus::Equipment,
         seed, sockets ? 1 : 0, nullptr, RoguelikeLoot::BaseKind::Equipment,
-        0, false, 0, nullptr, 0, false, dedicatedReward);
+        0, false, 0, nullptr, 0, false, dedicatedReward, combatRandom);
 }
 bool AwardFocusedClearLoot(void* game, UnitAny* player, int level) {
     const ZoneSlot& zone = zoneSlots[level];
@@ -9317,20 +9359,24 @@ bool AwardFocusedClearLoot(void* game, UnitAny* player, int level) {
     const int itemLevel = RoguelikeLoot::RewardItemLevel(
         zone.configuredRow.wMonLvl[0], zone.depth, zone.testOnly);
     const DWORD seed = GetTickCount() ^ (level * 2654435761u);
+    std::minstd_rand random(seed ? seed : 1);
+    std::minstd_rand* combatRandom = BossZone(zone.kind) ? nullptr : &random;
     const auto focus = zone.reward;
     const RoguelikeLoot::MonsterDropPlan plan =
         RoguelikeLoot::PlanMonsterDrops(focus, 3);
     const json first = DropFocusedClearPrimary(game, player, itemLevel,
-        playerLevel, zone, focus, seed);
-    if (first.value("ok", false))
+        playerLevel, zone, focus, seed, combatRandom);
+    if (first.contains("item_id"))
         runClearRewardIds[level][0] = first["item_id"].get<DWORD>();
-    else {
+    else if (!first.value("omitted", false)) {
         ReportRunDropFailure(game, player, first);
         if (!runError.empty()) return false;
     }
     if (!plan.secondary.count) return true;
     const json second = DropRunSocketable(game, player, nullptr, itemLevel,
-        playerLevel, static_cast<unsigned>(seed % 3u), seed ^ 0x9e3779b9u);
+        playerLevel, static_cast<unsigned>(seed % 3u), seed ^ 0x9e3779b9u,
+        combatRandom);
+    if (second.value("omitted", false)) return true;
     if (second.value("ok", false))
         runClearRewardIds[level][1] = second["item_id"].get<DWORD>();
     else {
@@ -9349,12 +9395,15 @@ void TryCompleteClear(void* game, int level) {
         std::memory_order_release);
     if (clear != ServerMonsters::RoomClearState::Clear) return;
     if (level == 20 && !runStarterRewardId) {
+        const DWORD seed = GetTickCount() ^ runPlayer->dwUnitId;
+        std::minstd_rand random(seed ? seed : 1);
         const json reward = DropRunReward(game, runPlayer, 1,
-            MarketCharacterLevel(), 4, true,
-            GetTickCount() ^ runPlayer->dwUnitId);
-        if (reward.value("ok", false))
+            MarketCharacterLevel(), 4, true, seed, 0, nullptr,
+            RoguelikeLoot::BaseKind::Equipment, 0, false, 0, nullptr, 0,
+            false, false, &random);
+        if (reward.contains("item_id"))
             runStarterRewardId = reward["item_id"].get<DWORD>();
-        else {
+        else if (!reward.value("omitted", false)) {
             ReportRunDropFailure(game, runPlayer, reward);
             if (!runError.empty()) return;
         }
