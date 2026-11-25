@@ -56,6 +56,13 @@ constexpr int RewardItemLevel(int monsterLevel, int zoneDepth,
     return testZone && zoneDepth >= 1 && zoneDepth <= 99 ?
         zoneDepth : monsterLevel;
 }
+// Only dedicated unique/set reward zones advance their selection and constructor level.
+constexpr int kSpecialRewardLevelBonus = 6;
+constexpr int SpecialRewardItemLevel(int itemLevel) noexcept {
+    return itemLevel < 1 ? 0 :
+        itemLevel >= 99 - kSpecialRewardLevelBonus ? 99 :
+        itemLevel + kSpecialRewardLevelBonus;
+}
 // Felloak is the lowest available unique; keep chest drops unique at low depth.
 constexpr int kChestMinimumUniqueItemLevel = 4;
 constexpr int ChestUniqueItemLevel(int itemLevel) noexcept {
@@ -65,6 +72,13 @@ constexpr int ChestUniqueItemLevel(int itemLevel) noexcept {
 constexpr int kChestUniqueSearchBonus = 12;
 constexpr unsigned ChestRewardCount(std::uint32_t roll) noexcept {
     return 2u + roll % 3u;
+}
+constexpr unsigned kSanctuaryPotionsPerType = 10;
+constexpr unsigned kMaximumChestRewardIds =
+    5 + 2 * kSanctuaryPotionsPerType;
+constexpr unsigned SanctuaryPotionTier(int playerLevel) noexcept {
+    const int tier = playerLevel < 1 ? 0 : playerLevel / 10;
+    return static_cast<unsigned>(tier >= 4 ? 5 : tier + 1);
 }
 constexpr unsigned BossCorruptedUniqueCount() noexcept { return 3; }
 constexpr bool ChestNaturalDropAllowed(int quality, bool potion) noexcept {
@@ -84,6 +98,12 @@ constexpr bool RewardBaseLevelsEligible(int baseLevel, int requiredLevel,
     bool ignoreBaseLevel = false) noexcept {
     return (ignoreBaseLevel || baseLevel <= itemLevel) &&
         (!starter || requiredLevel <= playerLevel);
+}
+// Named rewards can be found before they can be equipped; table requirements remain.
+constexpr bool RewardNamedLevelsEligible(int rowLevel, int requiredLevel,
+    int itemLevel, int playerLevel, bool dedicatedReward) noexcept {
+    return rowLevel <= itemLevel &&
+        requiredLevel <= (dedicatedReward ? itemLevel : playerLevel);
 }
 // Rune tier is run-depth scaled even when its vanilla base level is higher.
 constexpr bool MaterialBaseLevelEligible(int baseLevel, int itemLevel,

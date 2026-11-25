@@ -243,6 +243,7 @@ std::array<bool, 255> runUsedAreas{}; // Consumed during the active run; resume 
 std::array<bool, 255> runCleared{};
 std::array<bool, 255> runRetiredDestinations{}; // Rerolled-away IDs are never offered again.
 std::array<bool, 255> runPopulationReady{};
+std::array<std::atomic<bool>, 255> runWholePopulationReady{};
 constexpr BYTE kEncounterDegraded = 4;
 std::array<BYTE, 255> runEncounters{}; // 0 awaiting, 1 natural, 2 seeded, 3 failed, 4 degraded.
 std::string runEncounterWarning; // Only exposed for the active degraded room.
@@ -268,7 +269,7 @@ std::array<std::array<DWORD, 5>, 255> runShrineIds{};
 std::array<std::array<DWORD, 2>, 255> runClearRewardIds{};
 DWORD runStarterRewardId = 0;
 std::array<std::array<DWORD, 3>, 255> runChestIds{};
-std::array<std::array<std::array<DWORD, 5>, 3>, 255> runChestRewardIds{};
+std::array<std::array<std::array<DWORD, RoguelikeLoot::kMaximumChestRewardIds>, 3>, 255> runChestRewardIds{};
 std::array<std::array<BYTE, 3>, 255> runChestRewardCounts{};
 std::array<std::array<int, 12>, 255> runChestUniqueIds{};
 std::array<unsigned, 255> runChestUniqueCounts{};
@@ -1826,17 +1827,18 @@ int MatchingRewardBase(const D2ItemDataTbl* bases,
     return -1;
 }
 bool UniqueRewardRowEligible(const UniqueItemsTxt& row, int itemLevel,
-    int playerLevel, int uniqueLevelBonus) {
+    int playerLevel, int uniqueLevelBonus, bool dedicatedReward) {
     return (row.dwUniqueItemFlags & 1) &&
-        row.wLvl <= RoguelikeLoot::WssUniqueSearchLevel(
-            itemLevel, uniqueLevelBonus) &&
-        row.wLvlReq <= playerLevel;
+        RoguelikeLoot::RewardNamedLevelsEligible(row.wLvl, row.wLvlReq,
+            RoguelikeLoot::WssUniqueSearchLevel(itemLevel, uniqueLevelBonus),
+            playerLevel, dedicatedReward);
 }
 bool SelectUniqueRewardBases(Pending& reward, const D2ItemDataTbl* bases,
     const sgptDataTable* records, int itemLevel, int playerLevel,
     RoguelikeLoot::BaseKind kind, int charmSize,
     const int* excludedUniqueIds, unsigned excludedUniqueCount,
-    int uniqueLevelBonus, std::minstd_rand& random, unsigned& eligible) {
+    int uniqueLevelBonus, bool dedicatedReward,
+    std::minstd_rand& random, unsigned& eligible) {
     if (!records->dwUniqItemsRecs || records->dwUniqItemsRecs > 32768 ||
         !Readable(records->pUniqueItemsTxt,
             size_t(records->dwUniqItemsRecs) * sizeof(UniqueItemsTxt)))
@@ -1844,7 +1846,7 @@ bool SelectUniqueRewardBases(Pending& reward, const D2ItemDataTbl* bases,
     for (unsigned i = 0; i < records->dwUniqItemsRecs; ++i) {
         const UniqueItemsTxt& row = records->pUniqueItemsTxt[i];
         if (!UniqueRewardRowEligible(row, itemLevel, playerLevel,
-                uniqueLevelBonus) ||
+                uniqueLevelBonus, dedicatedReward) ||
             RoguelikeLoot::WssUniqueIdExcluded(
                 static_cast<int>(i), excludedUniqueIds, excludedUniqueCount))
             continue;
@@ -1857,13 +1859,15 @@ bool SelectUniqueRewardBases(Pending& reward, const D2ItemDataTbl* bases,
     return true;
 }
 bool SetRewardRowEligible(const SetItemsTxt& row,
-    const sgptDataTable* records, int itemLevel, int playerLevel) {
+    const sgptDataTable* records, int itemLevel, int playerLevel,
+    bool dedicatedReward) {
     return row.nSetId < records->dwSetsRecs &&
-        row.wLvl <= itemLevel && row.wLvlReq <= playerLevel;
+        RoguelikeLoot::RewardNamedLevelsEligible(row.wLvl, row.wLvlReq,
+            itemLevel, playerLevel, dedicatedReward);
 }
 bool SelectSetRewardBases(Pending& reward, const D2ItemDataTbl* bases,
     const sgptDataTable* records, int itemLevel, int playerLevel,
-    RoguelikeLoot::BaseKind kind, int charmSize,
+    RoguelikeLoot::BaseKind kind, int charmSize, bool dedicatedReward,
     std::minstd_rand& random, unsigned& eligible) {
     if (!records->dwSetItemsRecs || records->dwSetItemsRecs > 32768 ||
         !records->dwSetsRecs || records->dwSetsRecs > 32768 ||
@@ -1872,7 +1876,8 @@ bool SelectSetRewardBases(Pending& reward, const D2ItemDataTbl* bases,
         return false;
     for (unsigned i = 0; i < records->dwSetItemsRecs; ++i) {
         const SetItemsTxt& row = records->pSetItemsTxt[i];
-        if (!SetRewardRowEligible(row, records, itemLevel, playerLevel))
+        if (!SetRewardRowEligible(row, records, itemLevel, playerLevel,
+                dedicatedReward))
             continue;
         const int base = MatchingRewardBase(bases, records, row.szCode,
             itemLevel, playerLevel, kind, charmSize);
@@ -1932,7 +1937,7 @@ bool SelectReward(Pending& reward, int itemLevel, int playerLevel, bool starter,
     RoguelikeLoot::BaseKind kind = RoguelikeLoot::BaseKind::Equipment,
     int charmSize = 0, int* maximumSockets = nullptr,
     int uniqueLevelBonus = 0, const int* excludedUniqueIds = nullptr,
-    unsigned excludedUniqueCount = 0) {
+    unsigned excludedUniqueCount = 0, bool dedicatedReward = false) {
     D2ItemDataTbl* bases = nullptr;
     sgptDataTable* records = nullptr;
     if (!RewardLevelsValid(itemLevel, playerLevel) || !RewardTables(bases, records))
@@ -1943,15 +1948,15 @@ bool SelectReward(Pending& reward, int itemLevel, int playerLevel, bool starter,
     if (reward.quality == 7) {
         recordsValid = SelectUniqueRewardBases(reward, bases, records,
             itemLevel, playerLevel, kind, charmSize, excludedUniqueIds,
-            excludedUniqueCount, uniqueLevelBonus, random, eligible);
+            excludedUniqueCount, uniqueLevelBonus, dedicatedReward, random, eligible);
         if (recordsValid && !eligible && excludedUniqueCount) {
             recordsValid = SelectUniqueRewardBases(reward, bases, records,
                 itemLevel, playerLevel, kind, charmSize, nullptr, 0,
-                uniqueLevelBonus, random, eligible);
+                uniqueLevelBonus, dedicatedReward, random, eligible);
         }
     } else if (reward.quality == 5) {
         recordsValid = SelectSetRewardBases(reward, bases, records,
-            itemLevel, playerLevel, kind, charmSize, random, eligible);
+            itemLevel, playerLevel, kind, charmSize, dedicatedReward, random, eligible);
     } else {
         const int requestedQuality = reward.quality;
         for (unsigned attempt = 0;; ++attempt) {
@@ -2148,7 +2153,8 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
     RoguelikeLoot::BaseKind baseKind = RoguelikeLoot::BaseKind::Equipment,
     int charmSize = 0, bool corruptedUnique = false,
     int uniqueLevelBonus = 0, const int* excludedUniqueIds = nullptr,
-    unsigned excludedUniqueCount = 0, bool includeDiagnostics = false) {
+    unsigned excludedUniqueCount = 0, bool includeDiagnostics = false,
+    bool dedicatedReward = false) {
     if (sockets < 0 || sockets > 3)
         return Failure("requested socket count is outside the supported range");
     if (corruptedUnique && quality != 7)
@@ -2164,7 +2170,7 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
     reward.expectedEpoch = runEpoch;
     if (!SelectReward(reward, itemLevel, playerLevel, starter, entropy, sockets,
             baseKind, charmSize, &maximumSockets, uniqueLevelBonus,
-            excludedUniqueIds, excludedUniqueCount))
+            excludedUniqueIds, excludedUniqueCount, dedicatedReward))
         return Failure("no compiled level-eligible reward base and quality");
     WssCorruptionSelection corruption{};
     std::string corruptionError;
@@ -2181,6 +2187,16 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
         return failure;
     }
     UnitAny* item = generated.item;
+    if (dedicatedReward &&
+        (item->dwMode != ITEM_MODE_ON_GROUND ||
+         item->pItemData->dwItemLevel != static_cast<DWORD>(itemLevel) ||
+         item->pItemData->dwQuality != static_cast<DWORD>(quality) ||
+         item->pItemData->dwFileIndex != static_cast<DWORD>(
+             quality == 7 ? reward.uniqueId : reward.setId))) {
+        json failure = Failure("dedicated named reward constructor changed level, quality or identity");
+        failure["cleanup_uncertain"] = !RemoveRolledItem(game, player, item);
+        return failure;
+    }
     if (corruptedUnique &&
         !ApplyWssCorruption(game, item, entropy, corruption, corruptionError)) {
         json failure = Failure(corruptionError);
@@ -2447,11 +2463,15 @@ json DropMonsterItem(void* game, UnitAny* player, UnitAny* monster,
             RoguelikeLoot::BaseKind::Charm, entropy,
             static_cast<int>(RoguelikeLoot::CharmSizeForRewardIndex(materialSlot)));
     case RoguelikeLoot::DropKind::Unique:
-        return DropRunReward(game, player, itemLevel, playerLevel,
-            7, false, entropy, 0, monster);
+        return DropRunReward(game, player,
+            RoguelikeLoot::SpecialRewardItemLevel(itemLevel), playerLevel,
+            7, false, entropy, 0, monster, RoguelikeLoot::BaseKind::Equipment,
+            0, false, 0, nullptr, 0, false, true);
     case RoguelikeLoot::DropKind::Set:
-        return DropRunReward(game, player, itemLevel, playerLevel,
-            5, false, entropy, 0, monster);
+        return DropRunReward(game, player,
+            RoguelikeLoot::SpecialRewardItemLevel(itemLevel), playerLevel,
+            5, false, entropy, 0, monster, RoguelikeLoot::BaseKind::Equipment,
+            0, false, 0, nullptr, 0, false, true);
     case RoguelikeLoot::DropKind::None:
         break;
     }
@@ -4314,6 +4334,48 @@ bool ChestTileHasApproachSpace(const CollMap* map,
         }
     return false;
 }
+// Five tiles between portal centers leave their 3x3 footprints and
+// approach lanes separate. Prefer a compact triangle before the line fallback.
+template <typename Choose>
+bool TryCompactPortals(const CollMap* map, const std::vector<BYTE>& occupied,
+    const RunTile& entry, const RunTile& center, bool playerSouth,
+    RunLayout& layout, std::vector<BYTE>& reachable, std::vector<size_t>& queue,
+    const Choose& choose) {
+    for (int radius = 0; radius <= 4; ++radius) {
+        for (int dy = -radius; dy <= radius; ++dy) {
+            for (int dx = -radius; dx <= radius; ++dx) {
+                if ((std::max)(std::abs(dx), std::abs(dy)) != radius) continue;
+                for (int facing : {playerSouth ? 1 : -1, playerSouth ? -1 : 1}) {
+                    const int x = center.x + dx, y = center.y + dy;
+                    const std::array<RunTile, 3> triangle{{
+                        {x - 5, y + 2 * facing},
+                        {x, y - 3 * facing},
+                        {x + 5, y + 2 * facing},
+                    }};
+                    bool free = true;
+                    for (const RunTile& tile : triangle) {
+                        if (!RunCandidateFree(map, occupied, tile.x, tile.y)) {
+                            free = false;
+                            break;
+                        }
+                    }
+                    if (!free) continue;
+                    layout.portals = triangle;
+                    layout.actors = {};
+                    bool actorsFit = true;
+                    for (unsigned i = 0; i < layout.actorCount; ++i)
+                        if (!choose(i, layout.actorCount, false, layout.actors[i])) {
+                            actorsFit = false;
+                            break;
+                        }
+                    if (actorsFit && RunLayoutAccessible(map, entry, layout, reachable, queue))
+                        return true;
+                }
+            }
+        }
+    }
+    return false;
+}
 // One collision component and one plan for the whole event, rather than
 // placing each sprite at the first free tile three steps from the player.
 bool PlanRunLayoutFrom(Room1* room, const RunTile& entry, unsigned actorCount,
@@ -4358,8 +4420,8 @@ bool PlanRunLayoutFrom(Room1* room, const RunTile& entry, unsigned actorCount,
         const int rowOffset = sanctuaryActor ?
             (index < 3 ? -2 : 2) * (playerSouth ? 1 : -1) : 0;
         const int anchorY = portal ? portalY : actorY + rowOffset;
-        // A 17-tile-wide floor fits four interior merchant feet at four
-        // tiles apart; the three choice portals retain wider spacing.
+        // Merchant feet need four tiles; the legacy line fallback retains
+        // its wider seven-tile portal separation.
         const int actorSpacing = portal ? 7 : (actorCount >= 4 ? 4 : 5);
         int best = INT_MAX;
         bool found = false;
@@ -4392,6 +4454,11 @@ bool PlanRunLayoutFrom(Room1* room, const RunTile& entry, unsigned actorCount,
         }
         return found;
     };
+    if (TryCompactPortals(map, occupied, entry,
+            {minX + (maxX - minX) / 2, portalY}, playerSouth,
+            layout, reachable, queue, choose)) return true;
+    layout.portals = {};
+    layout.actors = {};
     // Reserve the choice side first: four merchants must not displace the
     // final vendor into the portal lane or against the front wall.
     for (unsigned i = 0; i < layout.portals.size(); ++i)
@@ -4932,11 +4999,10 @@ bool RecordRunOwnedObject(void* game, UnitAny* player, UnitAny* unit, int area) 
         level, unit->dwUnitId, player->dwUnitId, static_cast<DWORD>(area)};
     return true;
 }
-bool IsRunOwnedTrigger(void* game, const Pending& request,
-    const Pending::Zone& zone) {
+bool IsRunOwnedTrigger(void* game, const Pending& request) {
     return request.townEntry ||
         (runGame.load(std::memory_order_acquire) == game &&
-         request.expectedEpoch == runEpoch && !zone.testOnly);
+         request.expectedEpoch == runEpoch);
 }
 
 json CreateTrigger(void* game, UnitAny* player, const Pending& request,
@@ -5023,7 +5089,7 @@ json CreateTrigger(void* game, UnitAny* player, const Pending& request,
         Readable(trigger->pObjectPath, sizeof(ObjectPath)) &&
         trigger->pObjectPath->pRoom1 == room;
     const bool untouched = TargetUnused(player, *request.triggerJob);
-    const bool runOwned = IsRunOwnedTrigger(game, request, roll);
+    const bool runOwned = IsRunOwnedTrigger(game, request);
     const bool tracked = !placed || !runOwned ||
         RecordRunOwnedObject(game, player, trigger, request.triggerSource);
     const DWORD triggerId = placed ? trigger->dwUnitId : 0;
@@ -6333,7 +6399,9 @@ int __fastcall ClickHook(void* game, UnitAny* player, BYTE* packet, int size) {
                                 CompleteStarterEncounter(game, player);
                         } else if (zoneSlots[destination].configured &&
                             PortalArea(player, destination)) {
-                            runPopulationReady[destination] = true;
+                            runPopulationReady[destination] =
+                                zoneSlots[destination].kind != Pending::ZoneKind::Monster ||
+                                runWholePopulationReady[destination].load(std::memory_order_acquire);
                             CompleteArenaEncounter(game, player, destination);
                         }
                         result = 0;
@@ -6673,6 +6741,7 @@ json ArmRun(void* game, UnitAny* player, const Pending& request) {
         selectedTriggerEpochBySource.clear();
     }
     runPopulationReady.fill(false);
+    for (auto& ready : runWholePopulationReady) ready.store(false, std::memory_order_relaxed);
     runEncounters.fill(0);
     runBossUnit.fill(0);
     runBossDamageCount = 0;
@@ -7539,6 +7608,7 @@ void ContinueRunResume(void* game, UnitAny* player) {
         }
         runCleared[destination] = cleared;
         runPopulationReady[destination] = combat && cleared;
+        runWholePopulationReady[destination].store(combat && cleared, std::memory_order_release);
         runEncounters[destination] = combat && cleared ? 2 : 0;
         runChestSettled[destination] =
             zone.kind == Pending::ZoneKind::Chest || zone.kind == Pending::ZoneKind::Shrine ?
@@ -7574,7 +7644,9 @@ void ContinueRunResume(void* game, UnitAny* player) {
         if (destination == 20) {
             CompleteStarterEncounter(game, player);
         } else if (zoneSlots[destination].configured) {
-            runPopulationReady[destination] = true;
+            runPopulationReady[destination] =
+                zoneSlots[destination].kind != Pending::ZoneKind::Monster ||
+                runWholePopulationReady[destination].load(std::memory_order_acquire);
             CompleteArenaEncounter(game, player, destination);
         }
         if (!runError.empty()) return;
@@ -7591,20 +7663,10 @@ void ReportStart(void* game, UnitAny* player, const json& result) {
     memcpy(message + 3, text.data(), text.size());
     originalChat(game, player, message, static_cast<int>(text.size() + 4));
 }
-json DropSanctuaryElixir(void* game, UnitAny* player,
-    const RoguelikeAura::Config& aura, int playerLevel, DWORD seed) {
-    D2ItemDataTbl* bases = nullptr;
-    sgptDataTable* records = nullptr;
-    if (!RewardTables(bases, records)) return Failure("elixir item tables unavailable");
-    DWORD code = 0;
-    memcpy(&code, aura.itemCode, sizeof(code));
-    int baseId = -1;
-    const ItemsTxt* base = D2COMMON_GetItemTextFromItemCode(code, &baseId);
-    if (!base || baseId < 0 || baseId >= bases->nItemsTxtRecordCount ||
-        base != bases->pItemsTxt + baseId || base->dwcode != code)
-        return Failure("elixir item base unavailable");
+json DropSanctuaryItem(void* game, UnitAny* player,
+    int baseId, int playerLevel, DWORD seed) {
     Pending reward;
-    reward.id = "sanctuary-elixir";
+    reward.id = "sanctuary-reward";
     reward.playerId = player->dwUnitId;
     reward.level = playerLevel;
     reward.quality = 2;
@@ -7621,8 +7683,41 @@ json DropSanctuaryElixir(void* game, UnitAny* player,
     }
     return {{"ok", true}, {"item_id", generated.item->dwUnitId}};
 }
+json DropSanctuaryElixir(void* game, UnitAny* player,
+    const RoguelikeAura::Config& aura, int playerLevel, DWORD seed) {
+    D2ItemDataTbl* bases = nullptr;
+    sgptDataTable* records = nullptr;
+    if (!RewardTables(bases, records)) return Failure("elixir item tables unavailable");
+    DWORD code = 0;
+    memcpy(&code, aura.itemCode, sizeof(code));
+    int baseId = -1;
+    const ItemsTxt* base = D2COMMON_GetItemTextFromItemCode(code, &baseId);
+    if (!base || baseId < 0 || baseId >= bases->nItemsTxtRecordCount ||
+        base != bases->pItemsTxt + baseId || base->dwcode != code)
+        return Failure("elixir item base unavailable");
+    return DropSanctuaryItem(game, player, baseId, playerLevel, seed);
+}
+int SanctuaryPotionBase(bool mana, unsigned tier) {
+    D2ItemDataTbl* bases = nullptr;
+    sgptDataTable* records = nullptr;
+    if (!RewardTables(bases, records) || tier < 1 || tier > 5) return -1;
+    for (int baseId = 0; baseId < bases->nItemsTxtRecordCount; ++baseId) {
+        const ItemsTxt& row = bases->pItemsTxt[baseId];
+        if (row.szCode[0] == (mana ? 'm' : 'h') &&
+            row.szCode[1] == 'p' && row.szCode[2] == '0' + tier &&
+            (row.szCode[3] == '\0' || row.szCode[3] == ' ') &&
+            row.bspawnable && !row.bquest &&
+            RewardBaseIsPotion(bases, records, baseId))
+            return baseId;
+    }
+    return -1;
+}
 void DropSanctuaryChestRewards(void* game, UnitAny* player, int level, DWORD id) {
     const int playerLevel = MarketCharacterLevel();
+    if (playerLevel < 1 || playerLevel > 99) {
+        ReportRunDropFailure(game, player, Failure("sanctuary chest has no valid character level"));
+        return;
+    }
     constexpr unsigned count = sizeof(RoguelikeAura::kElixirsOfAuras) /
         sizeof(RoguelikeAura::kElixirsOfAuras[0]);
     std::array<int, count> requirements{};
@@ -7653,6 +7748,26 @@ void DropSanctuaryChestRewards(void* game, UnitAny* player, int level, DWORD id)
         }
         runChestRewardIds[level][0][runChestRewardCounts[level][0]++] =
             reward["item_id"].get<DWORD>();
+    }
+    const unsigned tier = RoguelikeLoot::SanctuaryPotionTier(playerLevel);
+    const int healthBase = SanctuaryPotionBase(false, tier);
+    const int manaBase = SanctuaryPotionBase(true, tier);
+    if (healthBase < 0 || manaBase < 0) {
+        ReportRunDropFailure(game, player, Failure("compiled health or mana potion tier unavailable"));
+        return;
+    }
+    for (const int base : {healthBase, manaBase}) {
+        for (unsigned i = 0; i < RoguelikeLoot::kSanctuaryPotionsPerType; ++i) {
+            const json reward = DropSanctuaryItem(game, player, base,
+                playerLevel, static_cast<DWORD>(random()));
+            if (!reward.value("ok", false)) {
+                ReportRunDropFailure(game, player, reward);
+                if (!runError.empty()) return;
+                continue;
+            }
+            runChestRewardIds[level][0][runChestRewardCounts[level][0]++] =
+                reward["item_id"].get<DWORD>();
+        }
     }
 }
 void SettleSanctuaryChest(void* game, UnitAny* player, int level) {
@@ -8157,6 +8272,21 @@ void ApplyStockMapMonster(void* game, UnitAny* monster, int area) {
     }
 }
 void OnWorldPopulationCompleted() {
+    const int active = runArrivalLevel ? runArrivalLevel :
+        runStage.load(std::memory_order_acquire);
+    void* game = runGame.load(std::memory_order_acquire);
+    if (active >= 13 && active <= 254 && active != 20 && game && runPlayer &&
+        ObservationTelemetry::MatchesContext(runEpoch, game, runPlayer) &&
+        PortalArea(runPlayer, active) && zoneSlots[active].configured &&
+        zoneSlots[active].kind == Pending::ZoneKind::Monster &&
+        !runWholePopulationReady[active].load(std::memory_order_acquire)) {
+        std::string error;
+        if (!ServerMonsters::PopulateLevelRooms(game, runPlayer, active, error)) {
+            runError = "complete monster population unavailable: " + error;
+            return;
+        }
+        runWholePopulationReady[active].store(true, std::memory_order_release);
+    }
     const int arrival = runArrivalLevel;
     if (arrival == 20 ||
         (arrival >= 13 && arrival <= 254 && zoneSlots[arrival].configured))
@@ -8171,6 +8301,8 @@ void OnWorldPopulationCompleted() {
 void OnPopulationCompleted(int level) {
     if (level < 13 || level > 254 ||
         (level != 20 && !zoneSlots[level].configured)) return;
+    if (level != 20 && zoneSlots[level].kind == Pending::ZoneKind::Monster &&
+        !runWholePopulationReady[level].load(std::memory_order_acquire)) return;
     void* game = runGame.load(std::memory_order_acquire);
     if (!game || (level != 20 && zoneGame != game) || !runPlayer ||
         !ObservationTelemetry::MatchesContext(runEpoch, game, runPlayer)) return;
@@ -8765,8 +8897,12 @@ bool RewardFocusAvailable(const Pending::Zone& zone,
     case Pending::RewardFocus::Equipment:
         return true;
     }
-    return SelectReward(candidate, itemLevel, playerLevel, false,
-        static_cast<DWORD>(random()), sockets, kind);
+    const bool dedicatedReward = focus == Pending::RewardFocus::Unique ||
+        focus == Pending::RewardFocus::Set;
+    return SelectReward(candidate,
+        dedicatedReward ? RoguelikeLoot::SpecialRewardItemLevel(itemLevel) : itemLevel,
+        playerLevel, false, static_cast<DWORD>(random()), sockets, kind,
+        0, nullptr, 0, nullptr, 0, dedicatedReward);
 }
 bool IsSiblingMarketOffer(const std::string& id,
     const std::shared_ptr<Pending>& candidate, const Pending& choice) {
@@ -9165,9 +9301,14 @@ json DropFocusedClearPrimary(void* game, UnitAny* player, int itemLevel,
             zone.affixes.quality == RoguelikeAffixes::Quality::Magic ? 4 :
             zone.affixes.quality == RoguelikeAffixes::Quality::Rare ? 6 : 2,
             playerLevel, seed, zone.depth == 1);
-    return DropRunReward(game, player, itemLevel, playerLevel,
-        quality, zone.depth == 1 && focus == Pending::RewardFocus::Equipment,
-        seed, sockets ? 1 : 0);
+    const bool dedicatedReward = focus == Pending::RewardFocus::Unique ||
+        focus == Pending::RewardFocus::Set;
+    return DropRunReward(game, player,
+        dedicatedReward ? RoguelikeLoot::SpecialRewardItemLevel(itemLevel) : itemLevel,
+        playerLevel, quality,
+        zone.depth == 1 && focus == Pending::RewardFocus::Equipment,
+        seed, sockets ? 1 : 0, nullptr, RoguelikeLoot::BaseKind::Equipment,
+        0, false, 0, nullptr, 0, false, dedicatedReward);
 }
 bool AwardFocusedClearLoot(void* game, UnitAny* player, int level) {
     const ZoneSlot& zone = zoneSlots[level];
@@ -9427,6 +9568,7 @@ void RestoreRoguelikeZones(bool saveSnapshot) {
     runDropFailureCount = 0;
     runError.clear();
     runPopulationReady.fill(false);
+    for (auto& ready : runWholePopulationReady) ready.store(false, std::memory_order_relaxed);
     runRetiredDestinations.fill(false);
     runEncounters.fill(0);
     runBossUnit.fill(0);

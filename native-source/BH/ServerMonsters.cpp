@@ -147,12 +147,15 @@ using RoomInitializer = void (__cdecl*)();
 RoomInitializer gRoomInitialize = nullptr, gLevelInitialize = nullptr;
 thread_local unsigned gPopulationDepth = 0;
 thread_local int gPopulationArea = 0;
+thread_local bool gPopulationSweep = false;
 std::atomic<uint32_t> gPopulationCalls{0};
 void __cdecl EnterPopulation() { ++gPopulationDepth; }
 void __cdecl ExitPopulation(bool world) {
     const unsigned depth = --gPopulationDepth;
-    if (!depth && gPopulationArea) ServerSpawns::OnPopulationCompleted(gPopulationArea);
-    if (!depth && world) ServerSpawns::OnWorldPopulationCompleted();
+    if (!depth && gPopulationArea && !gPopulationSweep)
+        ServerSpawns::OnPopulationCompleted(gPopulationArea);
+    if (!depth && world && !gPopulationSweep)
+        ServerSpawns::OnWorldPopulationCompleted();
     if (!depth) gPopulationArea = 0;
 }
 __declspec(naked) void RoomPopulationHook() {
@@ -898,6 +901,87 @@ bool Reserve(Room1* room, UnitAny* player, size_t count, std::vector<Tile>& tile
 }
 
 namespace ServerMonsters {
+// Called only from the server population hook; every room pin is released
+// before returning to the native world update.
+bool PopulateLevelRooms(void* game, UnitAny* player, int expectedLevel,
+    std::string& error) {
+    if (!gNaturalHookInstalled || !gRoomInitialize || gPopulationDepth ||
+        gPopulationSweep || gNaturalGame.load(std::memory_order_acquire) != game ||
+        !Valid(player) || !Valid(player->pAct) || !Valid(player->pPath) ||
+        !Valid(player->pPath->pRoom1) || !Valid(player->pPath->pRoom1->pRoom2)) {
+        error = "native room population context unavailable"; return false;
+    }
+    Level* level = player->pPath->pRoom1->pRoom2->pLevel;
+    if (!Valid(level) || level->dwLevelNo != static_cast<DWORD>(expectedLevel) ||
+        expectedLevel < 0 || expectedLevel >= static_cast<int>(gNaturalTargets.size()) ||
+        !gNaturalTargets[expectedLevel][0].load(std::memory_order_acquire)) {
+        error = "configured monster area unavailable"; return false;
+    }
+    HMODULE common = GetModuleHandleA("D2Common.dll");
+    const BYTE add[] = {0x8b,0x54,0x24,0x04,0x85,0xd2,0x75,0x1f};
+    const BYTE remove[] = {0x8b,0x4c,0x24,0x04,0x85,0xc9,0x75,0x1f};
+    auto* base = reinterpret_cast<const BYTE*>(common);
+    if (!LabProfile::VerifyCommon(error) || !base ||
+        !Readable(base + 0x3cca0, sizeof(add)) ||
+        !Readable(base + 0x3cbe0, sizeof(remove)) ||
+        memcmp(base + 0x3cca0, add, sizeof(add)) ||
+        memcmp(base + 0x3cbe0, remove, sizeof(remove)) ||
+        GetProcAddress(common, MAKEINTRESOURCEA(10401)) !=
+            reinterpret_cast<FARPROC>(const_cast<BYTE*>(base + 0x3cca0)) ||
+        GetProcAddress(common, MAKEINTRESOURCEA(11099)) !=
+            reinterpret_cast<FARPROC>(const_cast<BYTE*>(base + 0x3cbe0))) {
+        error = "unsupported native room data functions"; return false;
+    }
+    std::array<Room2*, 256> rooms{};
+    size_t count = 0;
+    for (Room2* room = level->pRoom2First; room; room = room->pRoom2Next) {
+        if (count == rooms.size() || !Valid(room) || room->pLevel != level ||
+            !room->dwSizeX || !room->dwSizeY ||
+            std::find(rooms.begin(), rooms.begin() + count, room) != rooms.begin() + count) {
+            error = "invalid native room catalog"; return false;
+        }
+        rooms[count++] = room;
+    }
+    if (!count) { error = "empty native room catalog"; return false; }
+    gPopulationSweep = true;
+    struct ResetSweep { ~ResetSweep() { gPopulationSweep = false; } } reset;
+    for (size_t i = 0; i < count; ++i) {
+        Room2* room = rooms[i];
+        if (!Valid(room) || room->pLevel != level) {
+            error = "native room catalog changed"; return false;
+        }
+        const bool pin = !room->pRoom1;
+        if (pin) D2COMMON_AddRoomData(player->pAct, expectedLevel,
+            room->dwPosX, room->dwPosY, nullptr);
+        Room1* active = room->pRoom1;
+        bool ready = Valid(active) && active->pRoom2 == room &&
+            Readable(reinterpret_cast<const BYTE*>(active) + 0x34, sizeof(DWORD));
+        if (ready) {
+            DWORD* flags = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(active) + 0x34);
+            if (!(*flags & 1)) {
+                __asm {
+                    push edi
+                    mov edi, game
+                    mov eax, active
+                    call RoomPopulationHook
+                    pop edi
+                }
+            }
+            ready = Valid(active) && active->pRoom2 == room &&
+                Readable(flags, sizeof(*flags)) && (*flags & 1);
+        }
+        if (pin) D2COMMON_RemoveRoomData(player->pAct, expectedLevel,
+            room->dwPosX, room->dwPosY, nullptr);
+        if (!ready) { error = "native room did not finish population"; return false; }
+    }
+    Room2* room = level->pRoom2First;
+    for (size_t i = 0; i < count; ++i) {
+        if (room != rooms[i]) { error = "native room catalog changed"; return false; }
+        room = room->pRoom2Next;
+    }
+    if (room) { error = "native room catalog grew"; return false; }
+    return true;
+}
 json NaturalCounters() {
     json samples = json::array();
     {

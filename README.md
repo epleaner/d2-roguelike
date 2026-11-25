@@ -9,14 +9,14 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 ## The run
 
 - The Rogue Encampment is a hub with no wilderness exit. Use the Abyss entrance to start or resume a run.
-- After a combat clear, pick from up to three one-way portals. Combat portal labels show the encounter, area level, modifiers, and reward.
+- After a combat clear, pick from up to three one-way portals, arranged together when space permits. Combat portal labels show the encounter, area level, modifiers, and reward.
 - Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
 - Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests.
-- Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms.
+- Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms. Unique and set reward zones can drop items up to six levels above the normal reward level.
 - Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
-- After a kill, chat shows how many monsters remain, until the area is clear.
+- After a kill, chat shows how many monsters remain in the area, including monsters you haven't encountered yet. The final kill doesn't print a count.
 
-Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs; the available auras expand as your character gains levels.
+Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs, 10 health potions, and 10 mana potions. Elixir availability and potion strength scale with your character's level.
 
 Softcore death ends the run and resets character progression to level one. Normal corpse and gold penalties still apply. The current pool of areas is finite.
 

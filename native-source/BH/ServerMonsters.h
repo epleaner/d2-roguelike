@@ -43,6 +43,7 @@ nlohmann::json NaturalCounters();
 bool EnableNaturalZone(void* game, const std::string& epoch, int level,
     const std::array<int, 4>& monsterClasses, unsigned monsterClassCount,
     int monsterLevel, std::string& error);
+bool PopulateLevelRooms(void* game, UnitAny* player, int level, std::string& error);
 nlohmann::json SpawnEventNpc(void* game, UnitAny* serverPlayer, int classId,
     int x, int y);
 void Clear();
