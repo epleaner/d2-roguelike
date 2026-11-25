@@ -31,7 +31,6 @@ import struct
 _I32 = struct.Struct("<i")
 _EMPTY = b"\x00" * 4
 _TOWN_OBJECTS = frozenset((52, 102, 110, 417))
-_NORTH_MARKER = (2, 492, 130, 41, 0)
 
 
 def _layout(source: bytes):
@@ -137,10 +136,9 @@ def reconstruct(source: bytes, operation: str, wall_cells: list[list[int]]) -> b
      path_count_offset, path_owners) = _layout(source)
     if operation == "clear" or operation == "clear_walls":
         kept = [] if operation == "clear" else objects
-    elif operation in ("town", "town_north"):
-        north = operation == "town_north"
+    elif operation == "town":
         kept = [row for row in objects if row[0] != 1 and
-                not (row[0] == 2 and (row[1] in _TOWN_OBJECTS or north and row[1] == 2))]
+                not (row[0] == 2 and row[1] in _TOWN_OBJECTS)]
     else:
         raise ValueError("Unsupported DS1 semantic edit")
     if path_owners:
@@ -150,11 +148,9 @@ def reconstruct(source: bytes, operation: str, wall_cells: list[list[int]]) -> b
         if any(owner not in removed_positions or owner in kept_positions for owner in path_owners):
             raise ValueError("Authenticated DS1 has a surviving or orphan NPC path")
     output = bytearray(source[:count_offset])
-    output += _I32.pack(len(kept) + (operation == "town_north"))
+    output += _I32.pack(len(kept))
     for row in kept:
         output += source[row[4]:row[4] + 20]
-    if operation == "town_north":
-        output += struct.pack("<5i", *_NORTH_MARKER)
     output += source[end_objects:path_count_offset]
     output += _I32.pack(0)
     if len(wall_cells) != len({tuple(cell) for cell in wall_cells}):

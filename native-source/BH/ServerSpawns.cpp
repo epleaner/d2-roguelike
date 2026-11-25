@@ -382,7 +382,7 @@ constexpr size_t kRunOwnedObjectCapacity = 512;
 std::array<RunOwnedObject, kRunOwnedObjectCapacity> runOwnedObjects{};
 size_t runOwnedObjectCount = 0;
 bool RemoveOwnedObject(void* game, UnitAny* player, DWORD id, UnitAny* expected,
-    const char** failureReason = nullptr);
+    const char** failureReason = nullptr, bool commit = true);
 bool ReleaseSelectedTarget(UnitAny* player);
 void* originalUnitName = nullptr;
 bool unitNameInstalled = false;
@@ -5053,7 +5053,7 @@ json CreateTrigger(void* game, UnitAny* player, const Pending& request,
 // The pinned S13 destructor removes the server unit but does not broadcast its
 // disappearance to this offline client. Both operations are required together.
 bool RemoveOwnedObject(void* game, UnitAny* player, DWORD id, UnitAny* expected,
-    const char** failureReason) {
+    const char** failureReason, bool commit) {
     auto fail = [&](const char* reason) {
         if (failureReason) *failureReason = reason;
         return false;
@@ -5084,6 +5084,7 @@ bool RemoveOwnedObject(void* game, UnitAny* player, DWORD id, UnitAny* expected,
     if (!Readable(sender, sizeof(senderSignature)) ||
         memcmp(sender, senderSignature, sizeof(senderSignature)))
         return fail("client_sender_signature_changed");
+    if (!commit) return true;
     using RemoveUnit = void (__fastcall*)(void*, UnitAny*);
     reinterpret_cast<RemoveUnit>(const_cast<BYTE*>(destructor))(game, expected);
     if (FindServerObject(game, id))
@@ -5164,7 +5165,8 @@ bool RunOwnedObjectMatches(void* game, const RunOwnedObject& owned,
         return false;
     return owned.level->dwLevelNo == owned.area;
 }
-json RemoveRunOwnedObjects(void* game, UnitAny* player) {
+json RemoveRunOwnedObjects(void* game, UnitAny* player,
+    int source = 0, bool commit = true) {
     if (!game || !player || !Readable(player, sizeof(UnitAny)) ||
         !player->pPath || !Readable(player->pPath, sizeof(Path)))
         return Failure("run portal cleanup context unavailable");
@@ -5178,7 +5180,7 @@ json RemoveRunOwnedObjects(void* game, UnitAny* player) {
     };
     for (size_t index = 0; index < runOwnedObjectCount;) {
         const RunOwnedObject owned = runOwnedObjects[index];
-        if (owned.game != game) {
+        if (owned.game != game || (source && owned.area != static_cast<DWORD>(source))) {
             ++index;
             continue;
         }
@@ -5186,8 +5188,10 @@ json RemoveRunOwnedObjects(void* game, UnitAny* player) {
         UnitAny* object = FindServerObject(game, owned.unitId);
         if (!object) {
             ++alreadyAbsent;
-            clearedIds[clearedCount++] = owned.unitId;
-            ForgetRunOwnedObjectAt(index);
+            if (commit) {
+                clearedIds[clearedCount++] = owned.unitId;
+                ForgetRunOwnedObjectAt(index);
+            } else ++index;
             continue;
         }
         if (owned.playerId != player->dwUnitId) {
@@ -5198,8 +5202,10 @@ json RemoveRunOwnedObjects(void* game, UnitAny* player) {
         if (object != owned.unit) {
             // The GUID now names a different unit; never remove that reused object.
             ++alreadyAbsent;
-            clearedIds[clearedCount++] = owned.unitId;
-            ForgetRunOwnedObjectAt(index);
+            if (commit) {
+                clearedIds[clearedCount++] = owned.unitId;
+                ForgetRunOwnedObjectAt(index);
+            } else ++index;
             continue;
         }
         if (!RunOwnedObjectMatches(game, owned, object)) {
@@ -5208,20 +5214,22 @@ json RemoveRunOwnedObjects(void* game, UnitAny* player) {
             continue;
         }
         if (player->pPath->pTargetUnit == object &&
-            !ReleaseSelectedTarget(player)) {
+            (!commit || !ReleaseSelectedTarget(player))) {
             failObject(owned.unitId, "selected_target_release_failed");
             ++index;
             continue;
         }
         const char* reason = nullptr;
-        if (!RemoveOwnedObject(game, player, owned.unitId, object, &reason)) {
+        if (!RemoveOwnedObject(game, player, owned.unitId, object, &reason, commit)) {
             failObject(owned.unitId, reason ? reason : "object_removal_failed");
             ++index;
             continue;
         }
-        ++removed;
-        clearedIds[clearedCount++] = owned.unitId;
-        ForgetRunOwnedObjectAt(index);
+        if (commit) {
+            ++removed;
+            clearedIds[clearedCount++] = owned.unitId;
+            ForgetRunOwnedObjectAt(index);
+        } else ++index;
     }
     if (clearedCount) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -5229,11 +5237,31 @@ json RemoveRunOwnedObjects(void* game, UnitAny* player) {
             choiceNames.erase(clearedIds[index]);
     }
     json result = {{"ok", failed == 0},
-        {"status", failed ? "uncertain" : "removed"},
+        {"status", failed ? "uncertain" : commit ? "removed" : "ready"},
         {"attempted", attempted}, {"removed", removed},
         {"already_absent", alreadyAbsent}, {"failed", failed}};
     if (!failures.empty()) result["failures"] = std::move(failures);
     return result;
+}
+json RetireSourceChoices(void* game, UnitAny* player, int source,
+    DWORD selectedId, UnitAny* selected) {
+    bool selectedTracked = false;
+    for (size_t index = 0; index < runOwnedObjectCount; ++index) {
+        const RunOwnedObject& owned = runOwnedObjects[index];
+        if (owned.game == game && owned.unitId == selectedId &&
+            owned.unit == selected && owned.playerId == player->dwUnitId &&
+            owned.area == static_cast<DWORD>(source)) {
+            selectedTracked = true;
+            break;
+        }
+    }
+    if (!selectedTracked)
+        return Failure("selected source choice ownership changed");
+    // Preflight the entire source before the first irreversible removal.
+    // Once warped, its Room1 may unload; never attempt that stale destructor.
+    json preflight = RemoveRunOwnedObjects(game, player, source, false);
+    if (!preflight.value("ok", false)) return preflight;
+    return RemoveRunOwnedObjects(game, player, source);
 }
 // S13 D2Common ordinal 10816 creates the destination Room1 on demand from
 // the authenticated Act and level ID. D2Game E19C0 performs the normal
@@ -6255,24 +6283,36 @@ int __fastcall ClickHook(void* game, UnitAny* player, BYTE* packet, int size) {
                 runError = error;
                 transit = Failure(error);
             } else {
-                bool entryRemoved = !choice->townEntry;
+                bool sourceRetired = false;
+                json choiceCleanup;
                 if (choice->townEntry) {
                     const char* reason = nullptr;
-                    entryRemoved = RetireSelectedTownEntry(game, player,
+                    sourceRetired = RetireSelectedTownEntry(game, player,
                         objectId, trigger, &reason);
-                    if (!entryRemoved) {
+                    if (!sourceRetired) {
                         transit = Failure("selected town entry could not be retired");
                         transit["cleanup_reason"] =
                             reason ? reason : "object_removal_failed";
                     }
+                } else {
+                    choiceCleanup = RetireSourceChoices(game, player,
+                        source, objectId, trigger);
+                    sourceRetired = choiceCleanup.value("ok", false);
+                    if (!sourceRetired) {
+                        runError = "source choice retirement uncertain";
+                        transit = Failure(runError);
+                        transit["cleanup"] = choiceCleanup;
+                    }
                 }
-                if (entryRemoved) {
+                if (sourceRetired) {
                     if (choice->townEntry)
                         runStage.store(source, std::memory_order_release);
                     runArrivalLevel = destination;
                     transit = WarpToFreshLevel(game, player, destination);
                     if (choice->townEntry)
                         transit["source_entry_removed"] = true;
+                    if (!choice->townEntry)
+                        transit["source_choice_cleanup"] = choiceCleanup;
                     if (transit.value("ok", false) || PortalArea(player, destination)) {
                         transit["ok"] = true;
                         transit["status"] = "transition_requested";
@@ -9218,8 +9258,25 @@ void RequestRunAuraPulse() {
     memcpy(packet + 3, "run aura", sizeof("run aura") - 1);
     D2NET_SendPacket(sizeof(packet), 0, packet);
 }
+void QueueAutomaticEntrance() {
+    static DWORD nextAttempt = 0; // The server's Queued->Handled CAS is the acknowledgement.
+    const DWORD now = GetTickCount();
+    if (static_cast<LONG>(now - nextAttempt) < 0) return;
+    auto expected = AutoEntrance::Waiting;
+    if (!autoEntrance.compare_exchange_strong(expected, AutoEntrance::Queued) &&
+        expected != AutoEntrance::Queued) return;
+    nextAttempt = now + 500;
+    // Native chat framing: command NUL, recipient NUL, extension length zero.
+    BYTE packet[5 + sizeof(kAutoEntranceCommand)] = {0x15, 1, 0};
+    memcpy(packet + 3, kAutoEntranceCommand, sizeof(kAutoEntranceCommand) - 1);
+    if (!D2NET_SendPacket(sizeof(packet), 0, packet) &&
+        expected == AutoEntrance::Waiting) {
+        expected = AutoEntrance::Queued;
+        autoEntrance.compare_exchange_strong(expected, AutoEntrance::Waiting);
+    }
+}
 void RequestAutomaticEntrance() {
-    if (autoEntrance.load(std::memory_order_acquire) != AutoEntrance::Waiting ||
+    if (autoEntrance.load(std::memory_order_acquire) == AutoEntrance::Handled ||
         !hookPairReady.load(std::memory_order_acquire) || !IsGameReady()) return;
     UnitAny* player = D2CLIENT_GetPlayerUnit();
     if (!PortalArea(player, 1) || player->dwMode == PLAYER_MODE_DEATH ||
@@ -9238,13 +9295,10 @@ void RequestAutomaticEntrance() {
     const bool eligible = site[0] == 0xa1 && operand == reinterpret_cast<DWORD>(mode) &&
         !memcmp(site + 5, tail, sizeof(tail)) && *mode == 0 &&
         Readable(title, sizeof(starterName)) && !memcmp(title, starterName, sizeof(starterName));
-    auto expected = AutoEntrance::Waiting;
-    if (!autoEntrance.compare_exchange_strong(expected,
-            eligible ? AutoEntrance::Queued : AutoEntrance::Handled) || !eligible) return;
-    // Native chat framing: command NUL, recipient NUL, extension length zero.
-    BYTE packet[5 + sizeof(kAutoEntranceCommand)] = {0x15, 1, 0};
-    memcpy(packet + 3, kAutoEntranceCommand, sizeof(kAutoEntranceCommand) - 1);
-    D2NET_SendPacket(sizeof(packet), 0, packet);
+    // A live town player may precede client title/mode readiness. Do not
+    // consume the one-shot request until its pinned client checks pass.
+    if (!eligible) return;
+    QueueAutomaticEntrance();
 }
 void SettleRunFrame() {
     RequestAutomaticEntrance();

@@ -66,7 +66,7 @@ The Roguelike launcher does **not** automatically modify your selected filter or
 4. Run the launcher and select the copied folder if it isn't already selected. Click **Play**. The first install needs an internet connection.
 5. Choose **Single Player**. The entrance appears automatically in town. Click **Enter the Abyss** to begin.
 
-Windows may warn about the launcher because it is unsigned. **If you have v0.8.2 or earlier, download the new executable:** older launchers cannot install this update or update themselves.
+Windows may warn about the launcher because it is unsigned. **If you have v0.8.3 or earlier, download the new executable:** older launchers cannot install this update or update themselves.
 
 ## Save and resume
 

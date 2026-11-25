@@ -257,9 +257,9 @@ DATA = json.loads(r'''
       "output": {
         "bytes": 56956,
         "path": "data/global/tiles/Act1/Town/TownN1.ds1",
-        "sha256": "889399d6288e155cf274d6734633b66109709912980bc94b59e4d69ad6d4f07e"
+        "sha256": "52e69419b682eadc147c5a2fadad950fe931659c70b31242c57c9e11d786b90f"
       },
-      "operation": "town_north",
+      "operation": "town",
       "walls": []
     },
     "data/global/tiles/Act1/Town/TownS1.ds1": {
