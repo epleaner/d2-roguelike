@@ -275,18 +275,24 @@ enum class RewardFocus : std::uint8_t {
     Equipment = 0, Socketables = 1, Unique = 2, Set = 3,
     Jewelry = 4, Charms = 5
 };
-constexpr unsigned RewardFocusIndex(unsigned count,
-    std::uint32_t roll) noexcept {
-    if (!count || count > 6) return 0;
-    const unsigned sample = roll < kBasisPoints ?
-        roll : kBasisPoints - 1;
-    return static_cast<unsigned>(
-        std::uint64_t(sample) * count / kBasisPoints);
+constexpr unsigned RewardFocusWeight(RewardFocus focus) noexcept {
+    return focus == RewardFocus::Unique || focus == RewardFocus::Set ? 1u : 2u;
 }
 constexpr RewardFocus RewardFocusForRoll(const RewardFocus* available,
     unsigned count, std::uint32_t roll) noexcept {
     if (!available || !count || count > 6) return RewardFocus::Equipment;
-    return available[RewardFocusIndex(count, roll)];
+    unsigned totalWeight = 0;
+    for (unsigned i = 0; i < count; ++i)
+        totalWeight += RewardFocusWeight(available[i]);
+    const unsigned sample = roll < kBasisPoints ? roll : kBasisPoints - 1;
+    unsigned selected = static_cast<unsigned>(
+        std::uint64_t(sample) * totalWeight / kBasisPoints);
+    for (unsigned i = 0; i < count; ++i) {
+        const unsigned weight = RewardFocusWeight(available[i]);
+        if (selected < weight) return available[i];
+        selected -= weight;
+    }
+    return RewardFocus::Equipment;
 }
 
 
