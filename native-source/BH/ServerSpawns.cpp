@@ -2082,16 +2082,16 @@ int RunEquipmentQuality(int quality, int playerLevel, DWORD seed, bool firstZone
     return quality == 2 && RoguelikeLoot::EarlyMagicRoll(
         playerLevel, EquipmentQualityRoll(seed)) ? 4 : quality;
 }
-bool RetainCombatItem(std::minstd_rand* random, int quality) {
+bool RetainCombatItem(std::minstd_rand* random, bool dedicatedReward) {
     return !random || RoguelikeLoot::KeepCombatDrop(false,
         static_cast<unsigned>((*random)()) % RoguelikeLoot::kBasisPoints,
-        quality);
+        dedicatedReward);
 }
 UnitAny* NativeCombatDrop(void* game, Drop* drop, int flags, bool designatedBoss,
     bool* omitted = nullptr) {
     static thread_local std::minstd_rand random(
         GetTickCount() ^ GetCurrentThreadId());
-    if (!RetainCombatItem(designatedBoss ? nullptr : &random, drop->quality)) {
+    if (!RetainCombatItem(designatedBoss ? nullptr : &random, false)) {
         if (omitted) *omitted = true;
         return nullptr;
     }
@@ -2182,7 +2182,7 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
         return Failure("requested socket count is outside the supported range");
     if (corruptedUnique && quality != 7)
         return Failure("boss corruption requires a unique item");
-    if (dedicatedReward && !RetainCombatItem(combatRandom, quality))
+    if (dedicatedReward && !RetainCombatItem(combatRandom, true))
         return {{"ok", true}, {"omitted", true}};
     Pending reward;
     int maximumSockets = 0;
@@ -2197,7 +2197,7 @@ json DropRunReward(void* game, UnitAny* player, int itemLevel, int playerLevel,
             baseKind, charmSize, &maximumSockets, uniqueLevelBonus,
             excludedUniqueIds, excludedUniqueCount, dedicatedReward))
         return Failure("no compiled level-eligible reward base and quality");
-    if (!dedicatedReward && !RetainCombatItem(combatRandom, reward.quality))
+    if (!dedicatedReward && !RetainCombatItem(combatRandom, false))
         return {{"ok", true}, {"omitted", true}};
     WssCorruptionSelection corruption{};
     std::string corruptionError;
@@ -2385,7 +2385,7 @@ json DropRunMaterial(void* game, UnitAny* player, int itemLevel, int playerLevel
     const int base = SelectMaterialBase(
         bases, itemLevel, playerLevel, kind, entropy);
     if (base < 0) return Failure("no compiled level-eligible gem or rune");
-    if (!RetainCombatItem(combatRandom, 2))
+    if (!RetainCombatItem(combatRandom, false))
         return {{"ok", true}, {"omitted", true}};
     Pending reward;
     reward.id = "run-material";

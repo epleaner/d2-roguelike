@@ -16,7 +16,7 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 - Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
 - After a kill, chat shows how many monsters remain in the area, including monsters you haven't encountered yet. The final kill doesn't print a count.
 
-Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs and 20 rejuvenation potions. Elixir availability scales with character level; full rejuvenation potions gradually replace regular ones and make up the entire supply from level 40.
+Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs and 10 rejuvenation potions. Elixir availability scales with character level; full rejuvenation potions gradually replace regular ones and make up the entire supply from level 40.
 
 Softcore death ends the run and resets character progression to level one. Normal corpse and gold penalties still apply. The current pool of areas is finite.
 
