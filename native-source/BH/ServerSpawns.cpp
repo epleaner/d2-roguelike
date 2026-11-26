@@ -8746,7 +8746,8 @@ RoguelikeProgression::FreshArenas FreshOfferArenas(UnitAny* player,
         if ((!offered || !(*offered)[target]) &&
             FreshRunArenaAvailable(player, target))
             fresh.Add({target, themed ? ArenaTheme(table, target) : 0u,
-                layouts ? (*layouts)[target] : -1});
+                layouts ? (*layouts)[target] : -1,
+                RoguelikePortalLabels::IsNonLargeMap(AuthoredMapTiles(table, target))});
     }
     fresh.Shuffle(random);
     return fresh;
@@ -8819,7 +8820,9 @@ void OfferChoices(void* game, int level, const RunLayout* supplied) {
             if (!createdCount) runError = "stock map-affix roll failed: " + rollError;
             return;
         }
-        const int target = themed ? fresh.TakeLayout(sourceAct, random) : fresh.Take(0);
+        const bool preferNonLarge = zone.kind == Pending::ZoneKind::Monster &&
+            RoguelikePortalLabels::IsSparseDensity(zone.density);
+        const int target = fresh.TakeLayout(themed ? sourceAct : 0u, random, preferNonLarge);
         if (!target) {
             if (!createdCount) runError = "no eligible destination for the rolled encounter";
             return;
@@ -9033,7 +9036,9 @@ bool RerollOfferedChoice(void* game, UnitAny* player,
                 encounter, densityBaseline, random, newZone, error,
                 !marketAlreadyOffered, std::nullopt, themed ? acts : 0,
                 &sourceAct)) return false;
-        newTarget = themed ? fresh.TakeLayout(sourceAct, random) : fresh.Take(0);
+        const bool preferNonLarge = newZone.kind == Pending::ZoneKind::Monster &&
+            RoguelikePortalLabels::IsSparseDensity(newZone.density);
+        newTarget = fresh.TakeLayout(themed ? sourceAct : 0u, random, preferNonLarge);
         if (!newTarget) return false;
         newZone.level = newTarget;
     } else {

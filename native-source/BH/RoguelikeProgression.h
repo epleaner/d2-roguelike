@@ -34,6 +34,7 @@ struct ArenaSlot {
     int level = 0;
     unsigned act = 0;
     int layout = -1;
+    bool nonLarge = false;
 };
 
 // Callers shuffle the slots once. Reserving a slot cannot consume any of the
@@ -56,15 +57,17 @@ public:
     }
     // The first slot for a chosen layout in the shuffled list is itself uniform.
     template <class Random>
-    int TakeLayout(unsigned act, Random& random) {
+    int TakeLayout(unsigned act, Random& random, bool preferNonLarge = false) {
         std::array<bool, 121> seen{};
         ArenaSlot* selected = nullptr;
-        unsigned layouts = 0;
+        unsigned totalWeight = 0;
         for (std::size_t i = 0; i < count_; ++i) {
             auto& slot = slots_[i];
             if (!slot.level || slot.act != act || seen[slot.layout]) continue;
             seen[slot.layout] = true;
-            if (std::uniform_int_distribution<unsigned>(1, ++layouts)(random) == 1)
+            const unsigned weight = preferNonLarge && slot.nonLarge ? 3u : 1u;
+            totalWeight += weight;
+            if (std::uniform_int_distribution<unsigned>(1, totalWeight)(random) <= weight)
                 selected = &slot;
         }
         if (!selected) return 0;

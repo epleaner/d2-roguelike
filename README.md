@@ -9,7 +9,7 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 ## The run
 
 - The Rogue Encampment is a hub with no wilderness exit. Use the Abyss entrance to start or resume a run.
-- After a combat clear, pick from up to three one-way portals, arranged together when space permits. Combat portal labels show the encounter, area level, modifiers, and reward.
+- After a combat clear, pick from up to three one-way portals, arranged together when space permits. Monster labels show the map size, density (when not normal), area level, modifiers, and reward.
 - Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
 - Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests.
 - Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms. Unique and set reward zones can drop items up to six levels above the normal reward level.

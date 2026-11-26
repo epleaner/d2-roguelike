@@ -224,6 +224,13 @@ inline bool AppendColoredLabel(wchar_t* output, std::size_t capacity,
         AppendColor(output, capacity, length, L'0');
 }
 
+constexpr bool IsNonLargeMap(std::uint64_t tiles) noexcept {
+    return tiles > 0 && tiles <= 700;
+}
+constexpr bool IsSparseDensity(int density) noexcept {
+    return density < 600;
+}
+
 inline const wchar_t* MapSize(std::uint64_t tiles) {
     if (tiles <= 144) return L"Tiny";
     if (tiles <= 400) return L"Small";
@@ -232,10 +239,21 @@ inline const wchar_t* MapSize(std::uint64_t tiles) {
 }
 
 inline const wchar_t* Density(int density) {
-    if (density < 600) return L"Sparse";
+    if (IsSparseDensity(density)) return L"Sparse";
     if (density < 1200) return L"Normal";
     if (density < 2000) return L"Dense";
     return L"Swarming";
+}
+
+inline bool AppendMonsterArea(wchar_t* output, std::size_t capacity,
+    std::size_t& length, const Request& request) {
+    if (request.mapTiles &&
+        (!AppendText(output, capacity, length, MapSize(request.mapTiles)) ||
+         !AppendChar(output, capacity, length, L' '))) return false;
+    if ((IsSparseDensity(request.density) || request.density >= 1200) &&
+        (!AppendText(output, capacity, length, Density(request.density)) ||
+         !AppendChar(output, capacity, length, L' '))) return false;
+    return AppendText(output, capacity, length, L"Area, Lv. ");
 }
 
 inline bool Format(const Request& request, wchar_t* output,
@@ -281,14 +299,10 @@ inline bool Format(const Request& request, wchar_t* output,
             if (stat.mapStat != 372 && !AppendEffect(output, capacity, length, stat))
                 return fail();
         }
-        if (!AppendChar(output, capacity, length, L'\n')) return fail();
-        if (request.mapTiles &&
-            (!AppendText(output, capacity, length, MapSize(request.mapTiles)) ||
-             !AppendText(output, capacity, length, L", "))) return fail();
-        if (!AppendText(output, capacity, length, Density(request.density))) return fail();
-    }
-    if (!AppendText(output, capacity, length, L"\nArea Lv. ") ||
-        !AppendInteger(output, capacity, length, request.areaLevel) ||
+        if (!AppendChar(output, capacity, length, L'\n') ||
+            !AppendMonsterArea(output, capacity, length, request)) return fail();
+    } else if (!AppendText(output, capacity, length, L"\nArea Lv. ")) return fail();
+    if (!AppendInteger(output, capacity, length, request.areaLevel) ||
         !AppendChar(output, capacity, length, L'\n') ||
         !AppendColor(output, capacity, length, monsterColor) ||
         !AppendMonsterName(output, capacity, length, request) ||
