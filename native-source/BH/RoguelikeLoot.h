@@ -36,6 +36,12 @@ constexpr unsigned ScaledTier(int level, unsigned tierCount,
     const unsigned sample = roll < kBasisPoints ? roll : kBasisPoints - 1;
     return lower + (lower + 1 < tierCount && sample < upperWeight ? 1u : 0u);
 }
+// The depth-scaled tier is a ceiling, not the only possible rune at that depth.
+constexpr unsigned RuneTierForRoll(int level, std::uint32_t ceilingRoll,
+    std::uint32_t selectionRoll) noexcept {
+    const unsigned ceiling = ScaledTier(level, 33, ceilingRoll);
+    return selectionRoll % (ceiling + 1);
+}
 constexpr unsigned CharmSizeForRewardIndex(unsigned index) noexcept {
     return index % 3u + 1u;
 }
@@ -68,6 +74,20 @@ constexpr int SpecialRewardItemLevel(int itemLevel) noexcept {
         itemLevel >= 99 - kSpecialRewardLevelBonus ? 99 :
         itemLevel + kSpecialRewardLevelBonus;
 }
+// Treasure slots: unique 20%, set 20%, rare 30%, rune 30%.
+enum class ChestReward : std::uint8_t { Unique, Set, Rare, Rune };
+constexpr ChestReward ChestRewardForRoll(std::uint32_t roll) noexcept {
+    const unsigned sample = roll % kBasisPoints;
+    return sample < 2000 ? ChestReward::Unique :
+        sample < 4000 ? ChestReward::Set :
+        sample < 7000 ? ChestReward::Rare : ChestReward::Rune;
+}
+constexpr unsigned kChestRewardCount = 5;
+constexpr unsigned kMaximumChestUniqueIds = 3u * kChestRewardCount;
+// Independently, one extra reroll consumable drops on 20% of opens.
+constexpr bool ChestDropsScroll(std::uint32_t roll) noexcept {
+    return roll % kBasisPoints < 2000;
+}
 // Felloak is the lowest available unique; keep chest drops unique at low depth.
 constexpr int kChestMinimumUniqueItemLevel = 4;
 constexpr int ChestUniqueItemLevel(int itemLevel) noexcept {
@@ -75,9 +95,6 @@ constexpr int ChestUniqueItemLevel(int itemLevel) noexcept {
         kChestMinimumUniqueItemLevel : itemLevel;
 }
 constexpr int kChestUniqueSearchBonus = 12;
-constexpr unsigned ChestRewardCount(std::uint32_t roll) noexcept {
-    return 2u + roll % 3u;
-}
 constexpr unsigned kSanctuaryRejuvenations = 10;
 constexpr unsigned kMaximumChestRewardIds = 5 + kSanctuaryRejuvenations;
 constexpr bool SanctuaryFullRejuvenation(int playerLevel,
@@ -86,9 +103,6 @@ constexpr bool SanctuaryFullRejuvenation(int playerLevel,
         (playerLevel > 1 && roll % 39u < static_cast<unsigned>(playerLevel - 1));
 }
 constexpr unsigned BossCorruptedUniqueCount() noexcept { return 3; }
-constexpr bool ChestNaturalDropAllowed(int quality, bool potion) noexcept {
-    return quality == 7 || potion;
-}
 constexpr bool InsideRoomMargin(int x, int y, int minX, int minY,
     int maxX, int maxY, int margin) noexcept {
     return margin >= 0 && minX <= maxX && minY <= maxY &&

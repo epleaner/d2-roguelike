@@ -154,7 +154,7 @@ struct RunResumeState {
     std::map<int, Pending::Zone> zones;
     std::map<int, bool> cleared;
     std::map<int, std::array<bool, 3>> chestSettled;
-    std::map<int, std::array<int, 12>> chestUniqueIds;
+    std::map<int, std::array<int, RoguelikeLoot::kMaximumChestUniqueIds>> chestUniqueIds;
     std::map<int, unsigned> chestUniqueCounts;
     int desiredLevel = 20;
     size_t currentIndex = 0;
@@ -271,7 +271,7 @@ DWORD runStarterRewardId = 0;
 std::array<std::array<DWORD, 3>, 255> runChestIds{};
 std::array<std::array<std::array<DWORD, RoguelikeLoot::kMaximumChestRewardIds>, 3>, 255> runChestRewardIds{};
 std::array<std::array<BYTE, 3>, 255> runChestRewardCounts{};
-std::array<std::array<int, 12>, 255> runChestUniqueIds{};
+std::array<std::array<int, RoguelikeLoot::kMaximumChestUniqueIds>, 255> runChestUniqueIds{};
 std::array<unsigned, 255> runChestUniqueCounts{};
 std::array<std::array<bool, 3>, 255> runChestSettled{};
 std::string runError;
@@ -1034,13 +1034,106 @@ StockFill originalStockFill = nullptr;
 unsigned observedAkaraPerms = 0, observedAkaraPotions = 0;
 unsigned filteredAkaraPotions = 0;
 bool observedAkaraTrade = false;
+// D2Game BEE30: EAX=game, ECX=item code, five callee-cleaned stack args.
+__declspec(naked) UnitAny* __stdcall CreateMarketStockItem(
+    void* game, UnitAny* npc, DWORD code, int quality, int itemLevel, int playerLevel) {
+    __asm {
+        push ebx
+        mov ebx, [esp + 8]
+        mov ecx, [esp + 16]
+        push dword ptr [esp + 28]
+        push dword ptr [esp + 28]
+        push dword ptr [esp + 28]
+        push 1
+        push dword ptr [esp + 28]
+        mov eax, ebx
+        call dword ptr [originalStoreItem]
+        pop ebx
+        ret 24
+    }
+}
+bool FillMarketKeys(void* game, UnitAny* player, UnitAny* npc) {
+    if (!originalStoreItem || !setVendorItemStat) return false;
+    const int playerLevel = D2COMMON_GetUnitStat(player, STAT_LEVEL, 0);
+    if (playerLevel < 1 || playerLevel > 99) return false;
+    const DWORD code = 0x2079656b; // "key "
+    int baseId = -1;
+    const ItemsTxt* base = D2COMMON_GetItemTextFromItemCode(code, &baseId);
+    if (!Readable(base, sizeof(ItemsTxt)) || baseId < 0 || base->dwcode != code)
+        return false;
+    const int itemLevel = (std::min)(99, playerLevel + 5);
+    for (unsigned i = 0; i < 3; ++i) {
+        UnitAny* item = CreateMarketStockItem(game, npc, code, 2, itemLevel, playerLevel);
+        if (!Readable(item, sizeof(UnitAny)) || item->dwType != UNIT_ITEM)
+            return false;
+        setVendorItemStat(item, STAT_AMMOQUANTITY, 1, 0);
+        if (D2COMMON_GetUnitStat(item, STAT_AMMOQUANTITY, 0) != 1)
+            return false;
+    }
+    return true;
+}
+// Fill remaining one-cell slots from this vendor's authenticated permanent
+// stock. Stop once a full pass cannot place an item; never manufacture codes.
+bool FillMarketSmallItems(void* game, UnitAny* player, UnitAny* npc, void* trade) {
+    const BYTE* bytes = static_cast<const BYTE*>(game);
+    if (!originalStoreItem || !Readable(bytes + 0x1D24, sizeof(void*))) return false;
+    const BYTE* control = *reinterpret_cast<const BYTE* const*>(bytes + 0x1D24);
+    if (!Readable(control, 8)) return false;
+    const BYTE* records = *reinterpret_cast<const BYTE* const*>(control + 4);
+    if (!Readable(records, 64 * 0x44)) return false;
+    const BYTE* record = nullptr;
+    for (unsigned i = 0; i < 64; ++i) {
+        const BYTE* candidate = records + i * 0x44;
+        if (*reinterpret_cast<const DWORD*>(candidate) == npc->dwTxtFileNo) {
+            record = candidate;
+            break;
+        }
+    }
+    if (!record || trade != record + 0x20) return false;
+    const unsigned count = *reinterpret_cast<const DWORD*>(record + 0x38);
+    const DWORD* codes = *reinterpret_cast<const DWORD* const*>(record + 0x34);
+    if (count > 128 || (count && !Readable(codes, count * sizeof(DWORD))))
+        return false;
+    const int playerLevel = D2COMMON_GetUnitStat(player, STAT_LEVEL, 0);
+    if (playerLevel < 1 || playerLevel > 99) return false;
+    const int itemLevel = (std::min)(99, playerLevel + 5);
+    std::array<DWORD, 128> candidates{};
+    unsigned eligible = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const DWORD code = codes[i];
+        int baseId = -1;
+        const ItemsTxt* base = D2COMMON_GetItemTextFromItemCode(code, &baseId);
+        if (code == 0x2079656b || !Readable(base, sizeof(ItemsTxt)) ||
+            baseId < 0 || base->dwcode != code || !base->bspawnable || base->bquest ||
+            base->blevel > itemLevel || base->binvwidth != 1 || base->binvheight != 1)
+            continue;
+        candidates[eligible++] = code;
+    }
+    if (!eligible) return true;
+    DWORD* seed = MarketStoreSeed(game);
+    if (!seed || !originalMarketRandom) return false;
+    for (unsigned pass = 0; pass < 10; ++pass) {
+        const int start = MarketNativeRandom(seed, 0, static_cast<int>(eligible));
+        if (start < 0 || static_cast<unsigned>(start) >= eligible) return false;
+        unsigned created = 0;
+        for (unsigned i = 0; i < eligible; ++i)
+            if (CreateMarketStockItem(game, npc, candidates[(start + i) % eligible],
+                    2, itemLevel, playerLevel))
+                ++created;
+        if (!created) break;
+    }
+    return true;
+}
 void __stdcall StockFillHook(void* game, UnitAny* player, UnitAny* npc,
     void* trade) {
     const BYTE* image = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2Game.dll"));
-    const bool ownedAkaraMarket = image && player && Readable(player, sizeof(UnitAny)) &&
-        npc && Readable(npc, sizeof(UnitAny)) && npc->dwTxtFileNo == 148 &&
+    const bool ownedMarket = image && player && Readable(player, sizeof(UnitAny)) &&
+        npc && Readable(npc, sizeof(UnitAny)) &&
         MarketStockCall(game, npc,
             D2COMMON_GetUnitStat(player, STAT_LEVEL, 0) + 5, image + 0xBF352);
+    const bool ownedAkaraMarket = ownedMarket && npc->dwTxtFileNo == 148;
+    if (ownedAkaraMarket && !FillMarketKeys(game, player, npc))
+        OutputDebugStringA("Roguelike: market key stock creation failed\n");
     if (ownedAkaraMarket) {
         const BYTE* bytes = reinterpret_cast<const BYTE*>(game);
         if (Readable(bytes + 0x1D24, sizeof(void*))) {
@@ -1089,7 +1182,10 @@ void __stdcall StockFillHook(void* game, UnitAny* player, UnitAny* npc,
                                     *reinterpret_cast<const DWORD**>(writableRecord + 0x34) =
                                         filtered.data();
                                     *reinterpret_cast<DWORD*>(writableRecord + 0x38) = kept;
-                                    originalStockFill(game, player, npc, trade);
+                                    for (unsigned attempt = 0; attempt < 3; ++attempt)
+                                        originalStockFill(game, player, npc, trade);
+                                    if (!FillMarketSmallItems(game, player, npc, trade))
+                                        OutputDebugStringA("Roguelike: market stock top-up failed\n");
                                     *reinterpret_cast<const DWORD**>(writableRecord + 0x34) = codes;
                                     *reinterpret_cast<DWORD*>(writableRecord + 0x38) = count;
                                     filteredAkaraPotions += removed;
@@ -1102,7 +1198,10 @@ void __stdcall StockFillHook(void* game, UnitAny* player, UnitAny* npc,
             }
         }
     }
-    originalStockFill(game, player, npc, trade);
+    for (unsigned attempt = 0; attempt < (ownedMarket ? 3u : 1u); ++attempt)
+        originalStockFill(game, player, npc, trade);
+    if (ownedMarket && !FillMarketSmallItems(game, player, npc, trade))
+        OutputDebugStringA("Roguelike: market stock top-up failed\n");
 }
 Create originalNaturalDrop = nullptr;
 UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags);
@@ -2099,20 +2198,8 @@ UnitAny* NativeCombatDrop(void* game, Drop* drop, int flags, bool designatedBoss
 }
 UnitAny* __stdcall NaturalDropHook(void* game, Drop* drop, int flags) {
     int chestArea = 0;
-    if (RoguelikeOwnedChestDropContext(game, drop, chestArea)) {
-        if (zoneSlots[chestArea].kind == Pending::ZoneKind::Shrine) return nullptr;
-        bool potion = false;
-        if (drop->quality != 7) {
-            D2ItemDataTbl* bases = nullptr;
-            sgptDataTable* records = nullptr;
-            potion = RewardTables(bases, records) &&
-                RewardBaseIsPotion(bases, records, drop->baseId);
-        }
-        if (!RoguelikeLoot::ChestNaturalDropAllowed(
-                drop->quality, potion))
-            return nullptr;
-        return NativeCombatDrop(game, drop, flags, false);
-    }
+    if (RoguelikeOwnedChestDropContext(game, drop, chestArea))
+        return nullptr; // All owned chest rewards are placed by settlement.
     int area = -1;
     if (!RoguelikeMonsterDropContext(game, drop, area))
         return originalNaturalDrop(game, drop, flags);
@@ -2356,9 +2443,10 @@ int SelectMaterialBase(D2ItemDataTbl* bases, int itemLevel, int playerLevel,
             }
     std::minstd_rand random(entropy ? entropy : 1);
     if (kind == RunMaterial::Rune) {
-        const unsigned target = RoguelikeLoot::ScaledTier(itemLevel,
-            static_cast<unsigned>(runeBases.size()),
-            static_cast<unsigned>(random()) % RoguelikeLoot::kBasisPoints);
+        const std::uint32_t ceilingRoll =
+            static_cast<unsigned>(random()) % RoguelikeLoot::kBasisPoints;
+        const unsigned target = RoguelikeLoot::RuneTierForRoll(
+            itemLevel, ceilingRoll, static_cast<unsigned>(random()));
         const int tier = ClosestAvailableTier(runeBases, target);
         return tier < 0 ? -1 : miscOffset + runeBases[tier];
     }
@@ -5648,6 +5736,30 @@ json CreateSanctuaryEvent(void* game, UnitAny* player, int level,
     return event;
 }
 
+// S14 vendor cache refresh: EBX=game, stack=act and last-player-left.
+void* marketRefreshNative = nullptr;
+__declspec(naked) void __stdcall RefreshActOneMarket(void* game) {
+    __asm {
+        push ebx
+        mov ebx, [esp + 8]
+        push 1
+        push 0
+        call dword ptr [marketRefreshNative]
+        pop ebx
+        ret 4
+    }
+}
+bool RefreshMarketInventory(void* game) {
+    const BYTE* image = reinterpret_cast<const BYTE*>(GetModuleHandleA("D2Game.dll"));
+    const BYTE signature[] = {0x83,0xec,0x0c,0x56,0x57,0x8b,0xbb,0x24,0x1d,0x00,0x00};
+    if (!game || !image || !Readable(image + 0x90320, sizeof(signature)) ||
+        memcmp(image + 0x90320, signature, sizeof(signature)))
+        return false;
+    marketRefreshNative = const_cast<BYTE*>(image + 0x90320);
+    RefreshActOneMarket(game);
+    return true;
+}
+
 json CompleteNonCombatZone(void* game, UnitAny* player, int level,
     const ZoneSlot& zone) {
     ServerMonsters::Request inspect;
@@ -5685,6 +5797,11 @@ json CompleteNonCombatZone(void* game, UnitAny* player, int level,
     }
     json event;
     if (zone.kind == Pending::ZoneKind::Merchant) {
+        if (!RefreshMarketInventory(game)) {
+            runEncounters[level] = 3;
+            runError = "native market inventory refresh unavailable";
+            return Failure(runError);
+        }
         event = {{"ok", true}, {"status", "market_spawned"},
             {"merchants", json::array()}};
         // Use stock NPC identities and their native commerce/recruiting menus.
@@ -6942,7 +7059,7 @@ bool ReadAffixSnapshot(const json& value, RoguelikeAffixes::Roll& roll) {
 }
 json ZoneSnapshot(const Pending::Zone& zone, bool cleared,
     const std::array<bool, 3>& chestSettled,
-    const std::array<int, 12>& chestUniqueIds,
+    const std::array<int, RoguelikeLoot::kMaximumChestUniqueIds>& chestUniqueIds,
     unsigned chestUniqueCount) {
     json chests = json::array();
     for (bool settled : chestSettled) chests.push_back(settled);
@@ -6970,7 +7087,7 @@ json ZoneSnapshot(const Pending::Zone& zone, bool cleared,
 bool ReadZoneSnapshot(const json& value, int expectedLevel,
     Pending::Zone& zone, bool& cleared,
     std::array<bool, 3>& chestSettled,
-    std::array<int, 12>& chestUniqueIds, unsigned& chestUniqueCount) {
+    std::array<int, RoguelikeLoot::kMaximumChestUniqueIds>& chestUniqueIds, unsigned& chestUniqueCount) {
     int level, classId, monsterLevel, density, densityBaseline, magicFind, depth;
     int kind, reward, otherShrine, secondOtherShrine, bossId;
     if (!value.is_object() ||
@@ -7115,7 +7232,7 @@ bool ParseRunSnapshot(const json& snapshot, const std::string& character,
                 Pending::Zone zone{};
                 bool cleared = false;
                 std::array<bool, 3> chests{};
-                std::array<int, 12> uniqueIds{};
+                std::array<int, RoguelikeLoot::kMaximumChestUniqueIds> uniqueIds{};
                 unsigned uniqueCount = 0;
                 if (!edge.contains("zone") ||
                     !ReadZoneSnapshot(edge["zone"], to, zone, cleared,
@@ -7141,7 +7258,7 @@ bool ParseRunSnapshot(const json& snapshot, const std::string& character,
             Pending::Zone zone{};
             bool cleared = false;
             std::array<bool, 3> chests{};
-            std::array<int, 12> uniqueIds{};
+            std::array<int, RoguelikeLoot::kMaximumChestUniqueIds> uniqueIds{};
             unsigned uniqueCount = 0;
             if (!ReadZoneSnapshot(
                     edge["zone"], to, zone, cleared, chests,
@@ -7834,6 +7951,52 @@ void SettleSanctuaryChest(void* game, UnitAny* player, int level) {
     runChestSettled[level][0] = true; // Never replay an uncertain reward.
     DropSanctuaryChestRewards(game, player, level, id);
 }
+json DropTreasureScroll(void* game, UnitAny* player, int playerLevel,
+    DWORD seed, std::minstd_rand& random) {
+    // Half Talismans, half Edicts; Edict types are equiprobable.
+    constexpr const char* edicts[] = {
+        "qbs ", "qmt ", "qsh ", "qch ", "qeq ",
+        "qso ", "qun ", "qse ", "qjw ", "qcm "
+    };
+    const char* code = static_cast<unsigned>(random()) % 2u ?
+        edicts[static_cast<unsigned>(random()) % 10u] : "rrl ";
+    D2ItemDataTbl* bases = nullptr;
+    sgptDataTable* records = nullptr;
+    if (!RewardTables(bases, records))
+        return Failure("compiled reroll consumable rows unavailable");
+    DWORD itemCode = 0;
+    memcpy(&itemCode, code, sizeof(itemCode));
+    int baseId = -1;
+    const ItemsTxt* base = D2COMMON_GetItemTextFromItemCode(itemCode, &baseId);
+    if (!base || baseId < 0 || baseId >= bases->nItemsTxtRecordCount ||
+        base != bases->pItemsTxt + baseId || base->dwcode != itemCode)
+        return Failure("reroll consumable base unavailable");
+    return DropSanctuaryItem(game, player, baseId, playerLevel, seed);
+}
+json DropTreasureItem(void* game, UnitAny* player, int itemLevel,
+    int playerLevel, DWORD seed, RoguelikeLoot::ChestReward kind,
+    const int* excludedIds, unsigned excludedCount) {
+    if (kind == RoguelikeLoot::ChestReward::Rune)
+        return DropRunMaterial(game, player, itemLevel, playerLevel,
+            RunMaterial::Rune, seed);
+    const int quality = kind == RoguelikeLoot::ChestReward::Unique ? 7 :
+        kind == RoguelikeLoot::ChestReward::Set ? 5 : 6;
+    const auto spawn = [&](int requestedQuality) {
+        return DropRunReward(game, player, itemLevel, playerLevel,
+            requestedQuality, false, seed, 0, nullptr,
+            RoguelikeLoot::BaseKind::Equipment, 0, false,
+            RoguelikeLoot::kChestUniqueSearchBonus,
+            excludedIds, excludedCount);
+    };
+    json reward = spawn(quality);
+    // Low-depth tables may not contain a named item; keep the slot as a rare.
+    if ((quality == 7 || quality == 5) &&
+        !reward.value("ok", false) &&
+        reward.value("error", "") ==
+            "no compiled level-eligible reward base and quality")
+        reward = spawn(6);
+    return reward;
+}
 void SettleChestRewards(void* game, UnitAny* player, int level) {
     if (zoneSlots[level].kind != Pending::ZoneKind::Chest ||
         !runCleared[level] || !runError.empty() ||
@@ -7864,7 +8027,7 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
         // the player is an Assassin) before changing the object mode.
         runChestSettled[level][index] = true; // Never replay an uncertain drop.
         const DWORD entropy = GetTickCount() ^ id ^ (level * 2654435761u);
-        const unsigned rewardCount = RoguelikeLoot::ChestRewardCount(entropy);
+        constexpr unsigned rewardCount = RoguelikeLoot::kChestRewardCount;
         const int itemLevel = RoguelikeLoot::ChestUniqueItemLevel(
             RoguelikeLoot::RewardItemLevel(
                 zoneSlots[level].configuredRow.wMonLvl[0],
@@ -7872,7 +8035,7 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
         const int playerLevel = MarketCharacterLevel();
         if (playerLevel < 1 || playerLevel > 99) {
             ++runDropFailureCount;
-            runDropError = "chest unique reward has no valid character level";
+            runDropError = "treasure chest has no valid character level";
             continue;
         }
         if (runChestUniqueCounts[level] > runChestUniqueIds[level].size()) {
@@ -7891,23 +8054,37 @@ void SettleChestRewards(void* game, UnitAny* player, int level) {
         for (unsigned rewardIndex = 0; rewardIndex < rewardCount; ++rewardIndex) {
             const DWORD rewardSeed = entropy ^
                 (0x9e3779b9u * (rewardIndex + 1));
-            const json reward = DropRunReward(game, player, itemLevel,
-                playerLevel, 7, false, rewardSeed, 0, nullptr,
-                RoguelikeLoot::BaseKind::Equipment, 0, false,
-                RoguelikeLoot::kChestUniqueSearchBonus,
-                uniqueIds.data(), uniqueCount, false, false, &random);
-            if (reward.value("omitted", false)) continue;
-            if (!reward.value("ok", false)) {
-                ReportRunDropFailure(game, player, reward);
+            const auto kind = RoguelikeLoot::ChestRewardForRoll(
+                static_cast<unsigned>(random()));
+            const json reward = DropTreasureItem(game, player, itemLevel,
+                playerLevel, rewardSeed, kind, uniqueIds.data(), uniqueCount);
+            if (!reward.value("ok", false) || reward.value("omitted", false)) {
+                ReportRunDropFailure(game, player, reward.value("omitted", false) ?
+                    Failure("treasure reward was unexpectedly omitted") : reward);
                 if (!runError.empty()) return;
                 continue;
             }
-            const int uniqueId = reward["unique_id"].get<int>();
-            if (!RoguelikeLoot::WssUniqueIdExcluded(
-                    uniqueId, uniqueIds.data(), uniqueCount))
-                uniqueIds[uniqueCount++] = uniqueId;
+            if (kind == RoguelikeLoot::ChestReward::Unique &&
+                reward.contains("unique_id")) {
+                const int uniqueId = reward["unique_id"].get<int>();
+                if (!RoguelikeLoot::WssUniqueIdExcluded(
+                        uniqueId, uniqueIds.data(), uniqueCount))
+                    uniqueIds[uniqueCount++] = uniqueId;
+            }
             runChestRewardIds[level][index][runChestRewardCounts[level][index]++] =
                 reward["item_id"].get<DWORD>();
+        }
+        if (RoguelikeLoot::ChestDropsScroll(static_cast<unsigned>(random()))) {
+            const json scroll = DropTreasureScroll(game, player, playerLevel,
+                static_cast<DWORD>(random()), random);
+            if (!scroll.value("ok", false) || scroll.value("omitted", false)) {
+                ReportRunDropFailure(game, player, scroll.value("omitted", false) ?
+                    Failure("treasure scroll was unexpectedly omitted") : scroll);
+                if (!runError.empty()) return;
+                continue;
+            }
+            runChestRewardIds[level][index][runChestRewardCounts[level][index]++] =
+                scroll["item_id"].get<DWORD>();
         }
     }
 }
@@ -9660,45 +9837,379 @@ void RestoreRoguelikeZones() {
     autoEntrance.store(AutoEntrance::Waiting, std::memory_order_release);
     RestoreRoguelikeZones(true);
 }
+// S14 leaves empty corpse units linked; the save writer skips them. Never
+// unlink a corpse list node without the game's full unit teardown.
+struct DeathBindings {
+    const BYTE* server = nullptr;
+    void* (__stdcall* firstCorpse)(Inventory*) = nullptr;
+    void* (__stdcall* nextCorpse)(void*) = nullptr;
+    DWORD (__stdcall* corpseId)(void*) = nullptr;
+};
+bool BindDeathItems(DeathBindings& bound, std::string& error) {
+    if (!LabProfile::VerifyServer(error) || !LabProfile::VerifyMod(error))
+        return false;
+    HMODULE server = GetModuleHandleA("D2Game.dll");
+    HMODULE common = GetModuleHandleA("D2Common.dll");
+    if (!server || !common) { error = "death item modules unavailable"; return false; }
+    struct Site { DWORD offset; const BYTE* bytes; size_t size; };
+    static const BYTE lookup[] = {0x85,0xc9,0x75,0x1f,0x68,0xd3,0x02};
+    static const BYTE action[] = {0x51,0x85,0xff,0x56,0x8b,0xf0,0x74,0x13};
+    static const BYTE remove[] = {0x51,0x53,0x57,0x8b,0x7c,0x24,0x10,0x85,0xff};
+    static const BYTE starter[] = {0x55,0x8b,0x6c,0x24,0x08,0x85,0xed,0x74,0x52};
+    for (const Site& site : {Site{0xE03A0,lookup,sizeof(lookup)},
+            Site{0x8C810,action,sizeof(action)}, Site{0xD2D90,remove,sizeof(remove)},
+            Site{0x385C0,starter,sizeof(starter)}}) {
+        const BYTE* address = reinterpret_cast<const BYTE*>(server) + site.offset;
+        if (!Readable(address, site.size) || memcmp(address, site.bytes, site.size)) {
+            error = "unrecognized S14 death item or starter binding";
+            return false;
+        }
+    }
+    const auto ordinal = [&](unsigned number, DWORD offset, const BYTE* signature,
+        size_t size) -> FARPROC {
+        const BYTE* address = reinterpret_cast<const BYTE*>(common) + offset;
+        FARPROC exported = GetProcAddress(common, MAKEINTRESOURCEA(number));
+        return exported == reinterpret_cast<FARPROC>(address) &&
+            Readable(address, size) && !memcmp(address, signature, size) ?
+            exported : nullptr;
+    };
+    static const BYTE first[] = {0x8b,0x44,0x24,0x04,0x85,0xc0,0x74,0x08};
+    static const BYTE next[] = {0x8b,0x44,0x24,0x04,0x85,0xc0,0x75,0x03};
+    bound.firstCorpse = reinterpret_cast<decltype(bound.firstCorpse)>(
+        ordinal(10284,0x1DD20,first,sizeof(first)));
+    bound.nextCorpse = reinterpret_cast<decltype(bound.nextCorpse)>(
+        ordinal(10348,0x1DC90,next,sizeof(next)));
+    bound.corpseId = reinterpret_cast<decltype(bound.corpseId)>(
+        ordinal(10155,0x1DC70,next,sizeof(next)));
+    if (!bound.firstCorpse || !bound.nextCorpse || !bound.corpseId) {
+        error = "S14 corpse list bindings unavailable";
+        return false;
+    }
+    bound.server = reinterpret_cast<const BYTE*>(server);
+    return true;
+}
+struct DeathItem { UnitAny* owner; UnitAny* item; };
+struct DeathPlan {
+    std::vector<DeathItem> items;
+    std::vector<UnitAny*> stash;
+    std::vector<UnitAny*> seen;
+};
+bool InspectSocketTree(UnitAny* item, Inventory* parent, DeathPlan& plan,
+    unsigned depth, std::string& error) {
+    if (depth > 8 || plan.seen.size() >= 4096 ||
+        !Readable(item, sizeof(UnitAny)) || item->dwType != UNIT_ITEM ||
+        !Readable(item->pItemData, sizeof(ItemData)) ||
+        item->pItemData->pOwnerInventory != parent ||
+        std::find(plan.seen.begin(), plan.seen.end(), item) != plan.seen.end()) {
+        error = "death item or socket ownership invalid";
+        return false;
+    }
+    plan.seen.push_back(item);
+    Inventory* sockets = item->pInventory;
+    if (!sockets) return true;
+    if (!Readable(sockets, sizeof(Inventory)) ||
+        sockets->dwSignature != 0x01020304 || sockets->pOwner != item ||
+        sockets->pCursorItem) {
+        error = "socket inventory invalid";
+        return false;
+    }
+    unsigned children = 0;
+    for (UnitAny* child = D2COMMON_GetItemFromInventory(sockets); child;
+         child = D2COMMON_GetNextItemFromInventory(child)) {
+        ++children;
+        if (!Readable(child, sizeof(UnitAny)) ||
+            child->dwMode != ITEM_MODE_SOCKETED_IN_ITEM ||
+            !InspectSocketTree(child, sockets, plan, depth + 1, error))
+            return false;
+    }
+    if (children != sockets->dwItemCount) {
+        error = "socket child count does not match native inventory";
+        return false;
+    }
+    return true;
+}
+bool InspectOwnedDeathItems(UnitAny* owner, UnitAny* player,
+    DeathPlan& plan, std::string& error) {
+    Inventory* inventory = owner->pInventory;
+    if (!Readable(inventory, sizeof(Inventory)) ||
+        inventory->dwSignature != 0x01020304 || inventory->pOwner != owner) {
+        error = "death inventory ownership invalid";
+        return false;
+    }
+    const auto item = [&](UnitAny* current, bool cursor) -> bool {
+        if (!Readable(current, sizeof(UnitAny)) || current->dwType != UNIT_ITEM ||
+            !Readable(current->pItemData, sizeof(ItemData)) ||
+            current->pItemData->pOwnerInventory != inventory) {
+            error = "owned death item invalid";
+            return false;
+        }
+        const ItemData* data = current->pItemData;
+        if (!cursor && owner == player &&
+            current->dwMode == ITEM_MODE_INV_STASH_CUBE_STORE &&
+            data->NodePage == NODEPAGE_STORAGE &&
+            data->ItemLocation == STORAGE_STASH) {
+            if (!InspectSocketTree(current, inventory, plan, 0, error))
+                return false;
+            plan.stash.push_back(current);
+            return true;
+        }
+        const bool storage = current->dwMode == ITEM_MODE_INV_STASH_CUBE_STORE &&
+            data->NodePage == NODEPAGE_STORAGE &&
+            (data->ItemLocation == STORAGE_INVENTORY ||
+             data->ItemLocation == STORAGE_CUBE);
+        const bool equipment = current->dwMode == ITEM_MODE_EQUIPPED &&
+            data->NodePage == NODEPAGE_EQUIP &&
+            data->ItemLocation == STORAGE_NULL;
+        const bool belt = current->dwMode == ITEM_MODE_IN_BELT &&
+            data->NodePage == NODEPAGE_BELTSLOTS &&
+            data->ItemLocation == STORAGE_NULL;
+        const bool held = cursor && current->dwMode == ITEM_MODE_ON_CURSOR &&
+            data->ItemLocation != STORAGE_STASH;
+        if (!(storage || equipment || belt || held) ||
+            !InspectSocketTree(current, inventory, plan, 0, error)) {
+            if (error.empty()) error = "unsupported death item location";
+            return false;
+        }
+        plan.items.push_back({owner,current});
+        return true;
+    };
+    unsigned chainCount = 0;
+    for (UnitAny* current = D2COMMON_GetItemFromInventory(inventory); current;
+         current = D2COMMON_GetNextItemFromInventory(current)) {
+        ++chainCount;
+        if (plan.items.size() + plan.stash.size() >= 4096 ||
+            !item(current, false)) return false;
+    }
+    if (chainCount != inventory->dwItemCount) {
+        error = "death inventory item count does not match linked items";
+        return false;
+    }
+    // The native cursor slot is separate from the linked-item count. Its
+    // ownership and uniqueness are checked by InspectSocketTree as well.
+    return !inventory->pCursorItem || item(inventory->pCursorItem, true);
+}
+UnitAny* ResolveDeathCorpse(const DeathBindings& bound, void* game, DWORD id) {
+    UnitAny* corpse = nullptr;
+    const BYTE* lookup = bound.server + 0xE03A0;
+    __asm {
+        mov ecx, game
+        mov edx, id
+        xor eax, eax
+        call lookup
+        mov corpse, eax
+    }
+    return corpse;
+}
+bool PlanDeathItems(const DeathBindings& bound, void* game, UnitAny* player,
+    DeathPlan& plan, std::string& error) {
+    if (!Readable(player, sizeof(UnitAny)) || !Readable(game, 0x1320) ||
+        !Readable(player->pPlayerData, 0xA0) ||
+        !Readable(player->pPlayerData->pClient, 0x1C4) ||
+        *reinterpret_cast<void**>(
+            reinterpret_cast<BYTE*>(player->pPlayerData->pClient) + 0x1A8) != game ||
+        !InspectOwnedDeathItems(player, player, plan, error)) {
+        if (error.empty()) error = "death player or client invalid";
+        return false;
+    }
+    unsigned corpseCount = 0;
+    for (void* node = bound.firstCorpse(player->pInventory), *next = nullptr;
+         node; node = next) {
+        if (++corpseCount > 16 || !Readable(node, 0x10) || plan.seen.size() >= 4096) {
+            error = "corpse list invalid";
+            return false;
+        }
+        DWORD id = bound.corpseId(node);
+        UnitAny* corpse = ResolveDeathCorpse(bound, game, id);
+        if (!Readable(corpse, sizeof(UnitAny)) || corpse == player ||
+            corpse->dwType != UNIT_PLAYER || corpse->dwUnitId != id) {
+            error = "corpse unit lookup invalid";
+            return false;
+        }
+        if (!(corpse->dwFlags2 & 0x04000000)) {
+            error = "corpse body flag unavailable";
+            return false;
+        }
+        if (*reinterpret_cast<void**>(
+            reinterpret_cast<BYTE*>(corpse) + 0x80) != game) {
+            error = "corpse game link invalid";
+            return false;
+        }
+        if (!InspectOwnedDeathItems(corpse, player, plan, error)) return false;
+        next = bound.nextCorpse(node);
+        if (next == node) { error = "cyclic corpse list"; return false; }
+    }
+    return true;
+}
+bool WipeDeathItems(const DeathBindings& bound, void* game, UnitAny* player,
+    const DeathPlan& plan, std::string& error) {
+    const BYTE* action = bound.server + 0x8C810;
+    const BYTE* remove = bound.server + 0xD2D90;
+    DWORD* client = player->pPlayerData->pClient;
+    for (const DeathItem& entry : plan.items) {
+        UnitAny* owner = entry.owner;
+        UnitAny* item = entry.item;
+        if (!Readable(owner, sizeof(UnitAny)) || !Readable(item, sizeof(UnitAny)) ||
+            !Readable(item->pItemData, sizeof(ItemData)) ||
+            item->pItemData->pOwnerInventory != owner->pInventory) {
+            error = "death item changed during cleanup";
+            return false;
+        }
+        if (owner == player) {
+            __asm {
+                push ebx
+                push edi
+                push game
+                mov eax, item
+                mov edi, owner
+                mov ebx, client
+                call action
+                pop edi
+                pop ebx
+            }
+        }
+        __asm {
+            push esi
+            push 0
+            push game
+            mov eax, owner
+            mov esi, item
+            call remove
+            pop esi
+        }
+    }
+    DeathPlan after;
+    if (!PlanDeathItems(bound, game, player, after, error) ||
+        !after.items.empty() || after.stash != plan.stash) {
+        if (error.empty()) error = "death inventory not empty or stash changed";
+        return false;
+    }
+    return true;
+}
+bool StarterKitReady(UnitAny* player, std::string& error) {
+    sgptDataTable* tables = Tables();
+    if (!tables || player->dwTxtFileNo > 6 ||
+        tables->dwCharsStatsRecs <= player->dwTxtFileNo ||
+        !Readable(tables->pCharStatsTxt,
+            size_t(tables->dwCharsStatsRecs) * sizeof(CharStatsTxt))) {
+        error = "starter class row unavailable";
+        return false;
+    }
+    const BYTE* kit = reinterpret_cast<const BYTE*>(
+        &tables->pCharStatsTxt[player->dwTxtFileNo].dwItem1);
+    unsigned count = 0;
+    for (unsigned index = 0; index < 10; ++index) {
+        DWORD code = 0;
+        memcpy(&code, kit + index * 8, sizeof(code));
+        const BYTE quantity = kit[index * 8 + 5];
+        if (!quantity) continue;
+        int baseId = -1;
+        if (!code || quantity > 16 ||
+            !D2COMMON_GetItemTextFromItemCode(code, &baseId)) {
+            error = "starter kit item invalid";
+            return false;
+        }
+        count += quantity;
+    }
+    if (!count || count > 64) { error = "starter kit count invalid"; return false; }
+    return true;
+}
+bool CreateDeathStarterKit(const DeathBindings& bound, void* game,
+    UnitAny* player, std::string& error) {
+    auto nativeStarter = reinterpret_cast<void (__stdcall*)(UnitAny*, void*)>(
+        const_cast<BYTE*>(bound.server + 0x385C0));
+    nativeStarter(player, game);
+    const BYTE* kit = reinterpret_cast<const BYTE*>(
+        &Tables()->pCharStatsTxt[player->dwTxtFileNo].dwItem1);
+    for (unsigned index = 0; index < 10; ++index) {
+        DWORD code = 0;
+        memcpy(&code, kit + index * 8, sizeof(code));
+        if (!kit[index * 8 + 5]) continue;
+        unsigned matches = 0;
+        for (UnitAny* item = D2COMMON_GetItemFromInventory(player->pInventory);
+             item; item = D2COMMON_GetNextItemFromInventory(item)) {
+            if (!Readable(item, sizeof(UnitAny)) || item->dwType != UNIT_ITEM ||
+                !Readable(item->pItemData, sizeof(ItemData)) ||
+                item->pItemData->pOwnerInventory != player->pInventory) {
+                error = "starter inventory invalid";
+                return false;
+            }
+            const ItemsTxt* text = D2COMMON_GetItemText(item->dwTxtFileNo);
+            if (Readable(text, sizeof(ItemsTxt)) && text->dwcode == code &&
+                item->pItemData->ItemLocation != STORAGE_STASH &&
+                (!kit[index * 8 + 4] ||
+                 (item->dwMode == ITEM_MODE_EQUIPPED &&
+                  item->pItemData->BodyLocation == kit[index * 8 + 4])))
+                ++matches;
+        }
+        if (matches < kit[index * 8 + 5]) {
+            error = "native starter kit incomplete; never retry builder";
+            return false;
+        }
+    }
+    return true;
+}
 void HandleRunDeath() {
     void* game = runGame.load(std::memory_order_acquire);
     UnitAny* player = runPlayer;
     if (!game || !Readable(player, sizeof(UnitAny))) return;
-    const bool dead = player->dwMode == PLAYER_MODE_DEATH ||
-        player->dwMode == PLAYER_MODE_DEAD;
-    if (!dead) {
-        runDeathHandled.store(false, std::memory_order_release);
+    if (player->dwMode != PLAYER_MODE_DEAD) {
+        if (player->dwMode != PLAYER_MODE_DEATH)
+            runDeathHandled.store(false, std::memory_order_release);
         return;
     }
-    if (runDeathHandled.exchange(true, std::memory_order_acq_rel)) return;
+    if (runDeathHandled.load(std::memory_order_acquire)) return;
     const auto mode = CharacterState::GetDeathMode(player);
     if (mode == CharacterState::DeathMode::Hardcore) return;
     if (mode != CharacterState::DeathMode::Softcore) {
         OutputDebugStringA("Roguelike death reset skipped: character mode unavailable\n");
         return;
     }
+    DeathBindings bound;
+    DeathPlan plan;
     std::string error;
+    if (!BindDeathItems(bound, error) || !StarterKitReady(player, error) ||
+        !PlanDeathItems(bound, game, player, plan, error)) {
+        runError = "death preflight rejected: " + error;
+        OutputDebugStringA(("Roguelike " + runError + "\n").c_str());
+        return;
+    }
     if (!DeleteRunSnapshot(player, error)) {
         runError = "death reset could not remove run snapshot: " + error;
         OutputDebugStringA(("Roguelike " + runError + "\n").c_str());
         return;
     }
-    const bool reset = CharacterState::ResetToLevelOne(game, player, error);
-    if (!reset)
-        OutputDebugStringA(("Roguelike Softcore death reset failed: " +
+    if (runDeathHandled.exchange(true, std::memory_order_acq_rel)) return;
+    const bool inventoryReset = WipeDeathItems(bound, game, player, plan, error);
+    if (!inventoryReset)
+        OutputDebugStringA(("Roguelike death inventory reset failed: " +
+            error + "\n").c_str());
+    const bool reset = inventoryReset &&
+        CharacterState::ResetToLevelOne(game, player, error);
+    if (inventoryReset && !reset)
+        OutputDebugStringA(("Roguelike Softcore progression reset failed: " +
+            error + "\n").c_str());
+    // Restore equipment even if progression failed after the run items were
+    // removed; do not call the builder if inventory cleanup was incomplete.
+    const bool starter = inventoryReset &&
+        CreateDeathStarterKit(bound, game, player, error);
+    if (inventoryReset && !starter)
+        OutputDebugStringA(("Roguelike starter kit restoration failed: " +
             error + "\n").c_str());
     const json portalCleanup = RemoveRunOwnedObjects(game, player);
     if (!portalCleanup.value("ok", false))
         OutputDebugStringA(("Roguelike death portal cleanup uncertain: " +
             portalCleanup.dump() + "\n").c_str());
     RestoreRoguelikeZones(false);
-    if (reset && portalCleanup.value("ok", false))
+    if (reset && starter && portalCleanup.value("ok", false))
         autoEntrance.store(AutoEntrance::Waiting, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(mutex);
-        lastRunSnapshotStatus["death_reset"] = reset;
+        lastRunSnapshotStatus["death_reset"] = reset && inventoryReset && starter;
+        lastRunSnapshotStatus["inventory_reset"] = inventoryReset;
+        lastRunSnapshotStatus["starter_kit"] = starter;
         lastRunSnapshotStatus["portal_cleanup"] = portalCleanup;
-        if (!reset) lastRunSnapshotStatus["death_reset_error"] = error;
+        if (!reset || !inventoryReset || !starter)
+            lastRunSnapshotStatus["death_reset_error"] = error;
     }
 }
 json RunSnapshotStatus() {

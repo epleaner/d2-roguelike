@@ -31,6 +31,7 @@ static_assert(offsetof(Skill, skillLevel) == 0x28, "skill instance ABI");
 static_assert(offsetof(CharStatsTxt, bStatPerLevel) == 0x50, "class growth ABI");
 static_assert(sizeof(CharStatsTxt) == 0xC4, "class row ABI");
 static_assert(offsetof(CharStatsTxt, bStr) == 0x30, "class starting attributes ABI");
+static_assert(offsetof(PlayerData, pClient) == 0x9C, "server client pointer ABI");
 
 bool Readable(const void* pointer, size_t bytes) {
     if (!pointer || !bytes) return false;
@@ -278,18 +279,47 @@ bool SkillChainValid(UnitAny* player) {
     if (!Valid(player) || !Valid(player->pInfo)) return false;
     Skill* current = player->pInfo->pFirstSkill;
     for (unsigned visited = 0; current; ++visited) {
-        if (visited >= 4096 || !Valid(current)) return false;
+        if (visited >= 4096 || !Valid(current) || !Valid(current->pSkillInfo)) return false;
         current = current->pNextSkill;
     }
     return true;
 }
-bool ResetHardSkillRanks(UnitAny* player) {
-    for (Skill* current = player->pInfo->pFirstSkill; current; current = current->pNextSkill) {
-        if (current->itemGUID == -1) current->skillLevel = 0;
+bool IsClassSkill(WORD id, const WORD* slots, DWORD count) {
+    for (DWORD index = 0; index < count; ++index)
+        if (slots[index] == id) return true;
+    return false;
+}
+bool ResetHardSkillRanks(UnitAny* player, const WORD* slots, DWORD count,
+    HMODULE server, HMODULE common) {
+    using PassiveRefresh = void (__stdcall*)(UnitAny*, int);
+    auto refresh = reinterpret_cast<PassiveRefresh>(
+        GetProcAddress(common, MAKEINTRESOURCEA(10056)));
+    auto* packet = reinterpret_cast<BYTE*>(server) + 0x8D5F0;
+    DWORD* client = player->pPlayerData->pClient;
+    for (Skill* skill = player->pInfo->pFirstSkill; skill; skill = skill->pNextSkill) {
+        if (skill->itemGUID != -1 ||
+            !IsClassSkill(skill->pSkillInfo->wSkillId, slots, count) ||
+            !skill->skillLevel) continue;
+        const WORD id = skill->pSkillInfo->wSkillId;
+        skill->skillLevel = 0;
+        refresh(player, id);
+        __asm {
+            push ebx
+            push esi
+            mov esi, player
+            mov bx, id
+            push 0
+            push 0
+            mov eax, client
+            mov edx, packet
+            call edx
+            pop esi
+            pop ebx
+        }
     }
-    for (Skill* current = player->pInfo->pFirstSkill; current; current = current->pNextSkill) {
-        if (current->itemGUID == -1 && current->skillLevel) return false;
-    }
+    for (Skill* skill = player->pInfo->pFirstSkill; skill; skill = skill->pNextSkill)
+        if (skill->itemGUID == -1 && skill->skillLevel &&
+            IsClassSkill(skill->pSkillInfo->wSkillId, slots, count)) return false;
     return true;
 }
 bool ResetBaseAttributes(void* game, UnitAny* player, const CharStatsTxt& cls,
@@ -346,8 +376,9 @@ bool ResetProgressionVitals(void* game, UnitAny* player, const CharStatsTxt& cls
         setStat(player, resource.maximum, static_cast<int>(target), 0);
         if (D2COMMON_GetBaseStatSigned(player, resource.maximum, 0) != target) return false;
         NotifyStatUpdate(game, player, resource.maximum, server);
-        setStat(player, resource.current, static_cast<int>(target), 0);
-        if (D2COMMON_GetBaseStatSigned(player, resource.current, 0) != target) return false;
+        const int current = resource.current == STAT_HP ? 0 : static_cast<int>(target);
+        setStat(player, resource.current, current, 0);
+        if (D2COMMON_GetBaseStatSigned(player, resource.current, 0) != current) return false;
         NotifyStatUpdate(game, player, resource.current, server);
     }
     return true;
@@ -450,8 +481,44 @@ DeathMode GetDeathMode(UnitAny* player) {
 struct ProgressionResetContext {
     const CharStatsTxt* classStats{};
     const ExperienceRow* experience{};
+    const WORD* classSkills{};
+    DWORD classSkillCount{};
     HMODULE server{}, common{};
 };
+bool ResolveClassSkills(const sgptDataTable* tables, unsigned classId,
+    const WORD*& classSkills, DWORD& classSkillCount) {
+    if (!tables->pPlayerSkillCount ||
+        !Readable(tables->pPlayerSkillCount, 7 * sizeof(DWORD)) ||
+        !tables->dwPlayerSkillCount || tables->dwPlayerSkillCount > 128 ||
+        !tables->pPlayerSkillList || !Readable(tables->pPlayerSkillList,
+            7 * tables->dwPlayerSkillCount * sizeof(WORD)) ||
+        !tables->dwSkillsRecs || tables->dwSkillsRecs > 4096 ||
+        !Readable(tables->pSkillsTxt, tables->dwSkillsRecs * sizeof(SkillsTxt))) return false;
+    const DWORD count = reinterpret_cast<const DWORD*>(tables->pPlayerSkillCount)[classId];
+    const auto* slots = reinterpret_cast<const int16_t*>(tables->pPlayerSkillList) +
+        classId * tables->dwPlayerSkillCount;
+    if (!count || count > 128 || count > tables->dwPlayerSkillCount) return false;
+    for (DWORD index = 0; index < count; ++index) {
+        const int id = slots[index];
+        if (id < 0 || static_cast<DWORD>(id) >= tables->dwSkillsRecs ||
+            tables->pSkillsTxt[id].wSkillId != static_cast<DWORD>(id)) return false;
+    }
+    classSkills = reinterpret_cast<const WORD*>(slots);
+    classSkillCount = count;
+    return true;
+}
+bool SkillSyncBindingsReady(HMODULE server, HMODULE common) {
+    static const BYTE skillPacket[] = {0x83,0xEC,0x0C,0x85,0xF6,0x57,0x8B,0xF8,
+        0x74,0x6C,0x85,0xFF,0x75,0x25,0x83,0x3E};
+    static const BYTE passiveRefresh[] = {0x83,0xEC,0x08,0x56,0x8B,0x74,0x24,0x14,
+        0x85,0xF6,0x0F,0x8C,0xC3,0x01,0x00,0x00};
+    return BoundCode(reinterpret_cast<const BYTE*>(server) + 0x8D5F0,
+            skillPacket, sizeof(skillPacket), server) &&
+        BoundCode(reinterpret_cast<const BYTE*>(common) + 0x52480,
+            passiveRefresh, sizeof(passiveRefresh), common) &&
+        GetProcAddress(common, MAKEINTRESOURCEA(10056)) ==
+            reinterpret_cast<FARPROC>(reinterpret_cast<BYTE*>(common) + 0x52480);
+}
 bool ResolveProgressionResetContext(unsigned classId,
     ProgressionResetContext& context, std::string& error) {
     if (!ProgressionBindingsReady(context.server, context.common)) {
@@ -463,8 +530,13 @@ bool ResolveProgressionResetContext(unsigned classId,
         classId >= tables->dwCharsStatsRecs ||
         !Readable(tables->pCharStatsTxt,
             size_t(tables->dwCharsStatsRecs) * sizeof(CharStatsTxt)) ||
-        !Readable(tables->pExperience, sizeof(ExperienceRow) * 101)) {
-        error = "native class or experience tables unavailable";
+        !Readable(tables->pExperience, sizeof(ExperienceRow) * 101) ||
+        !ResolveClassSkills(tables, classId, context.classSkills, context.classSkillCount)) {
+        error = "native class, experience, or skill table unavailable";
+        return false;
+    }
+    if (!SkillSyncBindingsReady(context.server, context.common)) {
+        error = "native skill sync bindings unavailable";
         return false;
     }
     context.classStats = &tables->pCharStatsTxt[classId];
@@ -475,8 +547,9 @@ bool ResetProgressionState(void* game, UnitAny* player,
     const ProgressionResetContext& context, const ProgressionVitals& previous,
     std::string& error) {
     const unsigned classId = player->dwTxtFileNo;
-    if (!SkillChainValid(player)) {
-        error = "player skill chain invalid";
+    if (!SkillChainValid(player) || !Valid(player->pPlayerData) ||
+        !Valid(player->pPlayerData->pClient)) {
+        error = "player skill chain or client invalid";
         return false;
     }
     if (!SetProgression(game, player, ProgressionField::Level, 1)) {
@@ -488,7 +561,8 @@ bool ResetProgressionState(void* game, UnitAny* player,
         error = "class starting attributes did not verify";
         return false;
     }
-    if (!ResetHardSkillRanks(player)) {
+    if (!ResetHardSkillRanks(player, context.classSkills, context.classSkillCount,
+        context.server, context.common)) {
         error = "hard skill reset did not verify";
         return false;
     }

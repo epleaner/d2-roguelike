@@ -11,14 +11,14 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 - The Rogue Encampment is a hub with no wilderness exit. Use the Abyss entrance to start or resume a run.
 - After a combat clear, pick from up to three one-way portals, arranged together when space permits. Monster labels show the map size, density (when not normal), area level, modifiers, and reward.
 - Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
-- Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests.
-- Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms. Unique and set reward zones are rarer, but can drop items up to six levels above the normal reward level.
+- Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests. Market inventories refresh for each new market; Akara sells three individual keys for 50,000 gold each.
+- Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms. Unique and set reward zones are rarer, but can drop items up to six levels above the normal reward level. Treasure chests each drop five items from unique, set, rare, and rune pools, with a chance of an additional reroll scroll.
 - Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
 - After a kill, chat shows how many monsters remain in the area, including monsters you haven't encountered yet. The final kill doesn't print a count.
 
 Each sanctuary has healing, experience, stamina, and skill shrines, plus one random shrine. An unlocked chest holds 1–5 aura elixirs and 10 rejuvenation potions. Elixir availability scales with character level; full rejuvenation potions gradually replace regular ones and make up the entire supply from level 40.
 
-Softcore death ends the run and resets character progression to level one. Normal corpse and gold penalties still apply. The current pool of areas is finite.
+Softcore death ends the run and resets the character to level one with its starting attributes and no invested or unspent stat or skill points. Run equipment and inventory are lost; the character receives and equips its class starting gear again. The current pool of areas is finite.
 
 ## Roguelike items
 
