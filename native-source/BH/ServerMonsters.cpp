@@ -1075,6 +1075,7 @@ bool Parse(const json& args, Operation operation, Request& output, std::string& 
         if (it.key() != "request_id" &&
             !(operation == Operation::Observe && it.key() == "expected_epoch") &&
             !(operation == Operation::Observe && it.key() == "unit_ids") &&
+            !(operation == Operation::Observe && it.key() == "stat_ids") &&
             !(operation == Operation::Inspect && it.key() == "unit_ids") &&
             !(operation == Operation::Spawn && it.key() == "enemies")) {
             error = "unknown enemy request field"; return false;
@@ -1086,6 +1087,21 @@ bool Parse(const json& args, Operation operation, Request& output, std::string& 
         if (candidate.expectedEpoch.empty() || candidate.expectedEpoch.size() > 128 ||
             candidate.expectedEpoch.find_first_not_of("0123456789abcdef-") != std::string::npos) {
             error = "expected_epoch must be a valid epoch string"; return false;
+        }
+    }
+    if (operation == Operation::Observe && args.contains("stat_ids")) {
+        const json& stats = args.at("stat_ids");
+        if (!stats.is_array() || stats.empty() || stats.size() > 64) {
+            error = "stat_ids must contain 1..64 distinct stat IDs"; return false;
+        }
+        for (const json& value : stats) {
+            int64_t idValue;
+            if (!Integer(value, 0, 511, idValue) ||
+                std::find(candidate.statIds.begin(), candidate.statIds.end(),
+                    static_cast<DWORD>(idValue)) != candidate.statIds.end()) {
+                error = "stat_ids must contain distinct IDs in 0..511"; return false;
+            }
+            candidate.statIds.push_back(static_cast<DWORD>(idValue));
         }
     }
     Room1* room = nullptr;
@@ -1279,6 +1295,7 @@ json ObserveSnapshot(void* game, UnitAny* serverPlayer, const Request& request,
         {"coverage", {{"player", true}, {"player_vitals", false}, {"selected_skills", false},
             {"selected_enemies", "requested_ids_only"}, {"requested_enemy_count", request.unitIds.size()},
             {"area_census", false}, {"runtime_data", false}, {"partial", false}}}};
+    if (!request.statIds.empty()) result["coverage"]["player_stats"] = false;
     json& player = result["player"];
     player = {{"unit_id", serverPlayer->dwUnitId}, {"class_id", serverPlayer->dwTxtFileNo},
         {"mode", serverPlayer->dwMode}, {"area_id", level},
@@ -1300,6 +1317,13 @@ json ObserveSnapshot(void* game, UnitAny* serverPlayer, const Request& request,
         player["max_mana_raw"] = gGetter(serverPlayer, 9, 0);
         player["skill_delay_active"] = D2COMMON_GetUnitState(serverPlayer, 121) != 0;
         result["coverage"]["player_vitals"] = true;
+        if (!request.statIds.empty()) {
+            player["stats"] = json::array();
+            for (DWORD statId : request.statIds)
+                player["stats"].push_back({{"stat_id", statId}, {"layer", 0},
+                    {"value", static_cast<int32_t>(gGetter(serverPlayer, statId, 0))}});
+            result["coverage"]["player_stats"] = true;
+        }
     } else result["coverage"]["partial"] = true;
     if (Valid(serverPlayer->pInfo)) {
         bool skillsReadable = true;

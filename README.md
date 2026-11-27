@@ -13,6 +13,7 @@ An offline roguelike mode for Project Diablo 2. Start a run in the Abyss, clear 
 - Fight through compact areas drawn from all five acts. Monsters, layouts, and modifiers vary; boss encounters can appear as you get deeper.
 - Visit markets for supplies and hirelings, sanctuaries for shrines and elixirs, and treasure rooms for locked chests. Market inventories refresh for each new market; Akara sells three individual keys for 50,000 gold each.
 - Gain a level on each combat clear, in addition to normal monster experience. Rewards can focus on equipment, sockets, uniques, sets, jewelry, or charms. Unique and set reward zones are rarer, but can drop items up to six levels above the normal reward level. Treasure chests each drop five items from unique, set, rare, and rune pools, with a chance of an additional reroll scroll.
+- Some rings, amulets, and boots can grant magic find or monster experience per run depth. Each affix adds 1% per entered zone, up to 99%; equipped bonuses stack. The experience affix does not increase the guaranteed level from a combat clear.
 - Use a reroll item or an Edict on an unopened portal to change that choice without changing the others.
 - After a kill, chat shows how many monsters remain in the area, including monsters you haven't encountered yet. The final kill doesn't print a count.
 

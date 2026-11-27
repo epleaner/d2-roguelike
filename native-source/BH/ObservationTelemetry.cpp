@@ -107,7 +107,7 @@ bool MatchesContext(const std::string& expectedEpoch, void* game, UnitAny* serve
 json Capture(void* game, UnitAny* serverPlayer, const ServerMonsters::Request& request) {
     std::lock_guard<std::mutex> lock(epochMutex);
     if (request.operation != ServerMonsters::Operation::Observe || request.unitIds.size() > 16 ||
-        !game || !ReadablePlayer(serverPlayer) || serverPlayer->dwType != 0)
+        request.statIds.size() > 64 || !game || !ReadablePlayer(serverPlayer) || serverPlayer->dwType != 0)
         return {{"ok", false}, {"error", "server observation context unavailable"}};
     DWORD start = 0, end = 0;
     if (!Frame(game, start)) return {{"ok", false}, {"error", "server frame unavailable"}};

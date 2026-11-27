@@ -9,8 +9,10 @@
 #include "McpServer.h"
 #include "ObservationTelemetry.h"
 #include "CombatTelemetry.h"
+#include "RoguelikeDepthMagic.h"
 
 #include <cstring>
+#include <cwchar>
 #include <cstdint>
 
 string BH::path;
@@ -38,10 +40,25 @@ namespace {
     // Client inventory-name callsite: mov al,[ebp+12a], after stock name
     // construction. BH's full Item module is intentionally not initialized.
     constexpr BYTE kRunNameSite[] = { 0x8A, 0x85, 0x2A, 0x01, 0x00, 0x00 };
+    void __stdcall AppendDepthTooltip(UnitAny* item, wchar_t* out, unsigned capacity);
+    void AddDepthNameLines(UnitAny* item, wchar_t* name, unsigned capacity) {
+        if (capacity > 4096) return;
+        wchar_t lines[256] = {};
+        AppendDepthTooltip(item, lines, 256);
+        const size_t lineLength = wcslen(lines);
+        const size_t nameLength = wcsnlen_s(name, capacity);
+        if (!lineLength || nameLength == capacity ||
+            lineLength + nameLength + 1 > capacity) return;
+        wmemmove(name + lineLength, name, nameLength + 1);
+        wmemcpy(name, lines, lineLength);
+    }
 
     void __fastcall FixRunConsumableName(wchar_t* name, UnitAny* item, int size) {
         if (!name || !item || item->dwType != UNIT_ITEM || size < 8)
             return;
+        if (**Var_D2CLIENT_SelectedInvItem() == item && item->pItemData &&
+            (item->pItemData->dwFlags & ITEM_IDENTIFIED))
+            AddDepthNameLines(item, name, static_cast<unsigned>(size));
         const ItemsTxt* text = D2COMMON_GetItemText(item->dwTxtFileNo);
         if (!text)
             return;
@@ -102,6 +119,38 @@ namespace {
         for (size_t i = 5; i < length; ++i) if (actual[i] != 0x90) return false;
         return true;
     }
+
+    void __stdcall AppendDepthTooltip(UnitAny* item, wchar_t* out, unsigned capacity) {
+        if (!item || item->dwType != UNIT_ITEM || !item->pItemData || !out ||
+            !capacity || capacity > 4096) return;
+        bool depthSuffix = false;
+        bool depthPrefix = false;
+        for (unsigned i = 0; i < 3; ++i) {
+            depthSuffix |= RoguelikeDepthMagic::Coefficient(item->pItemData->wSuffix[i]) != 0;
+            depthPrefix |= RoguelikeDepthMagic::ExperienceCoefficient(item->pItemData->wPrefix[i]) != 0;
+        }
+        if (!depthSuffix && !depthPrefix) return;
+        size_t length = wcsnlen_s(out, capacity);
+        if (length == capacity) return;
+        const wchar_t* lines[] = {
+            depthSuffix ? L"+1% Better Chance of Getting Magic Items per Run Depth" : nullptr,
+            depthPrefix ? L"+1% Experience Gained per Run Depth" : nullptr,
+        };
+        for (const wchar_t* line : lines) {
+            if (!line || wcsstr(out, line)) continue;
+            const size_t lineLength = wcslen(line);
+            const bool separator = length && out[length - 1] != L'\n';
+            if (lineLength + (separator ? 1 : 0) + 2 > capacity - length) continue;
+            size_t end = length;
+            if (separator) out[end++] = L'\n';
+            wmemcpy(out + end, line, lineLength);
+            out[end + lineLength] = L'\n';
+            out[end + lineLength + 1] = 0;
+            length = end + lineLength + 1;
+        }
+    }
+
+
 }
 
 bool BH::Startup(HINSTANCE module, VOID* reserved) {

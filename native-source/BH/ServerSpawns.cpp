@@ -16,6 +16,7 @@
 #include "RoguelikeLoot.h"
 #include "RoguelikeMerchantPrice.h"
 #include "RoguelikeResistance.h"
+#include "RoguelikeDepthMagic.h"
 #include <array>
 #include <detours.h>
 #include <tlhelp32.h>
@@ -195,6 +196,17 @@ std::array<BYTE, 0x400> mapMonsterBytes{}, mapPlayerBytes{};
 std::array<BYTE, 0xC0> mapGlobalBytes{};
 int mapPlayerAppliedArea = 0;
 int mapPlayerBeforeMagicFind = 0, mapPlayerAfterMagicFind = 0;
+using DepthValues = std::array<int, RoguelikeDepthMagic::kStats.size()>;
+struct DepthMagicState {
+    void* game = nullptr;
+    DWORD playerId = 0;
+    StatList* list = nullptr;
+    int area = 0;
+    std::uint64_t runSerial = 0;
+    DepthValues bonus{};
+};
+DepthMagicState depthMagic; // Mutated only by the verified server callbacks.
+std::atomic<bool> depthMagicActive{false};
 unsigned mapMonsterApplied = 0;
 unsigned mapMonsterStockExisting = 0;
 DWORD mapMonsterSampleUnit = 0;
@@ -3920,6 +3932,191 @@ void AppendZoneResistanceCleanupError(UnitAny* player, StatList* state,
     if (!ReleaseZoneResistanceState(player, state, module, cleanupError))
         error += "; resistance-state rollback failed: " + cleanupError;
 }
+// Affix identities persist even when their TXT rows emit no native stat.
+bool EquippedDepthCoefficients(UnitAny* player, DepthValues& coefficients,
+    std::string& error) {
+    coefficients = {};
+    Inventory* inventory = player->pInventory;
+    if (!Readable(inventory, sizeof(Inventory)) ||
+        inventory->dwSignature != 0x01020304 ||
+        inventory->pOwner != player) {
+        error = "depth modifier inventory ownership invalid";
+        return false;
+    }
+    unsigned visited = 0;
+    for (UnitAny* item = D2COMMON_GetItemFromInventory(inventory); item;
+         item = D2COMMON_GetNextItemFromInventory(item)) {
+        if (++visited > 4096 || !Readable(item, sizeof(UnitAny)) ||
+            item->dwType != UNIT_ITEM ||
+            !Readable(item->pItemData, sizeof(ItemData)) ||
+            item->pItemData->pOwnerInventory != inventory) {
+            error = "depth modifier item chain invalid";
+            return false;
+        }
+        const ItemData* data = item->pItemData;
+        if (item->dwMode != ITEM_MODE_EQUIPPED ||
+            data->NodePage != NODEPAGE_EQUIP ||
+            data->ItemLocation != STORAGE_NULL) continue;
+        DepthValues matches{};
+        for (WORD suffix : data->wSuffix)
+            matches[0] += RoguelikeDepthMagic::Coefficient(suffix);
+        for (WORD prefix : data->wPrefix)
+            matches[1] += RoguelikeDepthMagic::ExperienceCoefficient(prefix);
+        for (size_t i = 0; i < matches.size(); ++i) {
+            if (matches[i] > 1) {
+                error = "duplicate depth affix on one equipped item";
+                return false;
+            }
+            coefficients[i] += matches[i];
+        }
+    }
+    if (visited != inventory->dwItemCount) {
+        error = "depth modifier inventory chain count mismatch";
+        return false;
+    }
+    return true;
+}
+bool SetDepthDeltas(StatList* state, const DepthValues& previous,
+    const DepthValues& target, std::string& error) {
+    DepthValues original{};
+    for (size_t i = 0; i < original.size(); ++i)
+        original[i] = D2COMMON_GetStatValueFromStatList(
+            state, RoguelikeDepthMagic::kStats[i], 0);
+    for (size_t i = 0; i < target.size(); ++i) {
+        if (previous[i] == target[i]) continue;
+        const int next = original[i] - previous[i] + target[i];
+        const unsigned stat = RoguelikeDepthMagic::kStats[i];
+        if (D2COMMON_SetPropertyStat(state, stat, next, 0) &&
+            D2COMMON_GetStatValueFromStatList(state, stat, 0) == next) continue;
+        bool restored = true;
+        for (size_t j = 0; j <= i; ++j) {
+            if (previous[j] == target[j]) continue;
+            const unsigned rollbackStat = RoguelikeDepthMagic::kStats[j];
+            if (!D2COMMON_SetPropertyStat(state, rollbackStat, original[j], 0) ||
+                D2COMMON_GetStatValueFromStatList(state, rollbackStat, 0) != original[j])
+                restored = false;
+        }
+        error = restored ? "depth modifier stat update failed" :
+            "depth modifier stat update and rollback failed";
+        return false;
+    }
+    return true;
+}
+bool RetireDepthMagic(void* game, UnitAny* player, int area,
+    std::string& error) {
+    if (!depthMagic.area) return true;
+    if (!game || !player || depthMagic.game != game ||
+        depthMagic.playerId != player->dwUnitId || depthMagic.area != area) {
+        error = "depth modifier state owner changed";
+        return false;
+    }
+    StatList* state = D2COMMON_GetStateStatList(player, 0xc6);
+    if (state != depthMagic.list) {
+        error = "depth modifier stat list changed before retirement";
+        return false;
+    }
+    if (!SetDepthDeltas(state, depthMagic.bonus, {}, error)) return false;
+    depthMagic = {};
+    depthMagicActive.store(false, std::memory_order_release);
+    return true;
+}
+bool ValidateDepthOwner(void* game, UnitAny* player, std::string& error) {
+    if (!depthMagic.area) return true;
+    if (depthMagic.game != game || depthMagic.playerId != player->dwUnitId) {
+        depthMagic = {}; // The old game/player owns and frees its old list.
+        depthMagicActive.store(false, std::memory_order_release);
+    } else if (depthMagic.runSerial != runActiveSerial) {
+        if (D2COMMON_GetStateStatList(player, 0xc6)) {
+            error = "previous run depth state remains attached";
+            return false;
+        }
+        depthMagic = {}; // Native death already removed the old list.
+        depthMagicActive.store(false, std::memory_order_release);
+    }
+    return true;
+}
+bool ApplyDepthState(void* game, UnitAny* player, int area,
+    const DepthValues& target, std::string& error) {
+    StatList* state = D2COMMON_GetStateStatList(player, 0xc6);
+    if (depthMagic.area && state != depthMagic.list) {
+        error = "depth modifier state was replaced";
+        return false;
+    }
+    if (depthMagic.area && depthMagic.bonus == target) return true;
+    if (!depthMagic.area && target == DepthValues{}) return true;
+    const BYTE* module = reinterpret_cast<const BYTE*>(
+        GetModuleHandleA("ProjectDiablo.dll"));
+    if (!ZoneResistanceStateApiReady(module)) {
+        error = "depth modifier native state helpers unavailable";
+        return false;
+    }
+    bool created = false;
+    if (!state) {
+        state = AllocateZoneResistanceState(game, player, module, error);
+        if (!state) return false;
+        created = true;
+    }
+    if (!SetDepthDeltas(state, depthMagic.bonus, target, error)) {
+        if (created) AppendZoneResistanceCleanupError(player, state, module, error);
+        return false;
+    }
+    if (created) {
+        if (!AttachZoneResistanceState(player, state, module, error)) {
+            AppendZoneResistanceCleanupError(player, state, module, error);
+            return false;
+        }
+    } else {
+        using Refresh = void (__stdcall*)(UnitAny*);
+        reinterpret_cast<Refresh>(const_cast<BYTE*>(module + 0x30bd90))(player);
+    }
+    depthMagic = {game, player->dwUnitId, state, area, runActiveSerial, target};
+    depthMagicActive.store(target != DepthValues{}, std::memory_order_release);
+    return true;
+}
+bool RetireDeadDepthMagic(void* game, UnitAny* player, std::string& error) {
+    StatList* attached = D2COMMON_GetStateStatList(player, 0xc6);
+    if (depthMagic.game == game &&
+        depthMagic.playerId == player->dwUnitId && depthMagic.area &&
+        attached == depthMagic.list) {
+        if (!RetireDepthMagic(game, player, depthMagic.area, error)) return false;
+        const BYTE* module = reinterpret_cast<const BYTE*>(
+            GetModuleHandleA("ProjectDiablo.dll"));
+        if (!ReleaseZoneResistanceState(player, attached, module, error)) return false;
+    }
+    // Native death cleanup may have freed the list before this packet.
+    depthMagic = {};
+    depthMagicActive.store(false, std::memory_order_release);
+    return true;
+}
+bool RefreshDepthMagic(void* game, UnitAny* player, std::string& error) {
+    if (!game || !player || player->dwType != UNIT_PLAYER ||
+        runGame.load(std::memory_order_acquire) != game ||
+        runPlayer != player || runEpoch.empty()) return true;
+    if (player->dwMode == PLAYER_MODE_DEATH ||
+        player->dwMode == PLAYER_MODE_DEAD)
+        return RetireDeadDepthMagic(game, player, error);
+    if (!ValidateDepthOwner(game, player, error)) return false;
+    const int area = runStage.load(std::memory_order_acquire);
+    if (!PortalArea(player, area) ||
+        (area != 20 && (area < 13 || area > 254 ||
+          !zoneSlots[area].configured || mapPlayerAppliedArea != area)))
+        return true;
+    const int depth = area == 20 ? 1 : zoneSlots[area].depth;
+    if (depth < 1 || depth > 99) {
+        error = "depth modifier run depth outside 1..99";
+        return false;
+    }
+    if (depthMagic.area &&
+        (depthMagic.game != game || depthMagic.playerId != player->dwUnitId ||
+         depthMagic.area != area)) {
+        error = "prior depth modifier zone was not retired";
+        return false;
+    }
+    DepthValues target{};
+    if (!EquippedDepthCoefficients(player, target, error)) return false;
+    for (int& coefficient : target) coefficient *= depth;
+    return ApplyDepthState(game, player, area, target, error);
+}
 bool PrepareZonePlayerState(void* game, UnitAny* player, bool hasMapAffixes,
     int penalty, const BYTE* module, StatList*& state,
     bool& createdResistanceState, std::string& error) {
@@ -4006,11 +4203,15 @@ bool NormalizeZonePlayerAffixes(UnitAny* player, StatList* state,
     return true;
 }
 bool RetireZonePlayer(void* game, UnitAny* player, int source, std::string& error) {
-    if (!mapPlayerAppliedArea) return true;
-    if (!game || !player || mapMonsterGame != game ||
-        mapPlayerAppliedArea != source || !PortalArea(player, source)) {
+    if (game && player && !ValidateDepthOwner(game, player, error))
+        return false;
+    if (!mapPlayerAppliedArea && !depthMagic.area) return true;
+    if (!game || !player || !PortalArea(player, source) ||
+        (mapPlayerAppliedArea &&
+         (mapMonsterGame != game || mapPlayerAppliedArea != source))) {
         error = "prior zone player-affix owner changed"; return false;
     }
+    if (!RetireDepthMagic(game, player, source, error)) return false;
     StatList* state = D2COMMON_GetStateStatList(player, 0xc6);
     if (state) {
         const BYTE* module = reinterpret_cast<const BYTE*>(GetModuleHandleA("ProjectDiablo.dll"));
@@ -8138,6 +8339,14 @@ int __fastcall ChatHook(void* game, UnitAny* player, BYTE* packet, int size) {
         SettleRunAfterArrival(game, player);
         return 0;
     }
+    if (command == "run depth") {
+        std::string error;
+        if (!RefreshDepthMagic(game, player, error) && !error.empty()) {
+            runError = "native depth modifier: " + error;
+            OutputDebugStringA(("Roguelike " + runError + "\n").c_str());
+        }
+        return 0;
+    }
     if (command == kAutoEntranceCommand) {
         auto expected = AutoEntrance::Queued;
         if (autoEntrance.compare_exchange_strong(expected, AutoEntrance::Handled))
@@ -9633,6 +9842,36 @@ void RequestRunAuraPulse() {
     memcpy(packet + 3, "run aura", sizeof("run aura") - 1);
     D2NET_SendPacket(sizeof(packet), 0, packet);
 }
+void RequestDepthMagicPulse() {
+    if (!runGame.load(std::memory_order_acquire)) return;
+    const int area = runStage.load(std::memory_order_acquire);
+    if (area != 20 && (area < 13 || area > 254)) return;
+    static DWORD nextAttempt = 0;
+    const DWORD now = GetTickCount();
+    if (static_cast<LONG>(now - nextAttempt) < 0) return;
+    nextAttempt = now + 200;
+    if (!depthMagicActive.load(std::memory_order_acquire)) {
+        UnitAny* player = D2CLIENT_GetPlayerUnit();
+        if (!Readable(player, sizeof(UnitAny)) ||
+            !Readable(player->pInventory, sizeof(Inventory)) ||
+            player->pInventory->pOwner != player) return;
+        bool equipped = false;
+        for (int slot : {2, 6, 7, 9}) {
+            UnitAny* item = D2COMMON_GetItemByBodyLoc(player->pInventory, slot);
+            if (!Readable(item, sizeof(UnitAny)) || item->dwType != UNIT_ITEM ||
+                !Readable(item->pItemData, sizeof(ItemData))) continue;
+            for (WORD suffix : item->pItemData->wSuffix)
+                equipped |= RoguelikeDepthMagic::Coefficient(suffix) != 0;
+            for (WORD prefix : item->pItemData->wPrefix)
+                equipped |= RoguelikeDepthMagic::ExperienceCoefficient(prefix) != 0;
+            if (equipped) break;
+        }
+        if (!equipped) return;
+    }
+    BYTE packet[16] = {0x15, 1, 0};
+    memcpy(packet + 3, "run depth", sizeof("run depth") - 1);
+    D2NET_SendPacket(sizeof(packet), 0, packet);
+}
 void QueueAutomaticEntrance() {
     static DWORD nextAttempt = 0; // The server's Queued->Handled CAS is the acknowledgement.
     const DWORD now = GetTickCount();
@@ -9677,6 +9916,7 @@ void RequestAutomaticEntrance() {
 }
 void SettleRunFrame() {
     RequestAutomaticEntrance();
+    RequestDepthMagicPulse();
     HandleRunDeath();
     FlushRemainingMonstersChat();
     RequestRunAuraPulse();

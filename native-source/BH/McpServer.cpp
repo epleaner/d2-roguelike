@@ -467,9 +467,11 @@ json ToolsList() {
             {"minItems", 1}, {"maxItems", 16}, {"uniqueItems", true}}}}, json::array({"request_id", "unit_ids"}));
     add("get_area_state", "Census actual hostile monster identities and generated/loaded rooms in the current offline server area.",
         {{"request_id", text}}, json::array({"request_id"}));
-    add("get_observation", "Capture a coherent nonce-correlated server frame; the MCP worker awaits the server result for up to three seconds after game-thread submission. On pending, inspect get_spawn_result with the same request_id; never replay.",
+    add("get_observation", "Capture a coherent nonce-correlated server frame with optional effective player stat IDs (layer 0); the MCP worker awaits the server result for up to three seconds after game-thread submission. On pending, inspect get_spawn_result with the same request_id; never replay.",
         {{"request_id", text}, {"expected_epoch", text},
-         {"unit_ids", {{"type", "array"}, {"items", integer}, {"maxItems", 16}, {"uniqueItems", true}}}},
+         {"unit_ids", {{"type", "array"}, {"items", integer}, {"maxItems", 16}, {"uniqueItems", true}}},
+         {"stat_ids", {{"type", "array"}, {"items", {{"type", "integer"}, {"minimum", 0}, {"maximum", 511}}},
+            {"minItems", 1}, {"maxItems", 64}, {"uniqueItems", true}}}},
         json::array({"request_id"}));
     add("start_combat_trace", "Start one bounded native combat event trace in the offline server nonce callback.",
         {{"request_id", text}, {"expected_epoch", text}, {"duration", {{"type", "integer"}, {"minimum", 1}, {"maximum", 60}}},

@@ -30,6 +30,7 @@ struct Request {
     Operation operation = Operation::Spawn;
     std::vector<Enemy> enemies;
     std::vector<DWORD> unitIds;
+    std::vector<DWORD> statIds;
     std::string expectedEpoch;
     int encounterLevel = 0; // Internal single-group zone encounter; 0 keeps normal spawns.
 };
