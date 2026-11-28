@@ -86,3 +86,5 @@ The launcher accepts a `ProjectD2\loot.filter` link only when it points to a reg
 ## Source and notices
 
 The [release](https://github.com/epleaner/d2-roguelike/releases/latest) includes corresponding launcher and native source archives. Third-party notices are available from **Licenses** in the launcher. The launcher artwork contains an image from Diablo II, copyright Blizzard Entertainment. This fan-made project is not affiliated with or endorsed by Blizzard.
+
+Native run-depth effects are listed in `native-source/BH/RoguelikeDepthMagic.h`. Adding one also requires a compatible statless affix in the mod data and gameplay verification; editing the registry alone does not create an affix.

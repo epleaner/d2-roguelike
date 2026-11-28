@@ -196,7 +196,7 @@ std::array<BYTE, 0x400> mapMonsterBytes{}, mapPlayerBytes{};
 std::array<BYTE, 0xC0> mapGlobalBytes{};
 int mapPlayerAppliedArea = 0;
 int mapPlayerBeforeMagicFind = 0, mapPlayerAfterMagicFind = 0;
-using DepthValues = std::array<int, RoguelikeDepthMagic::kStats.size()>;
+using DepthValues = std::array<int, RoguelikeDepthMagic::kEffects.size()>;
 struct DepthMagicState {
     void* game = nullptr;
     DWORD playerId = 0;
@@ -3957,11 +3957,8 @@ bool EquippedDepthCoefficients(UnitAny* player, DepthValues& coefficients,
         if (item->dwMode != ITEM_MODE_EQUIPPED ||
             data->NodePage != NODEPAGE_EQUIP ||
             data->ItemLocation != STORAGE_NULL) continue;
-        DepthValues matches{};
-        for (WORD suffix : data->wSuffix)
-            matches[0] += RoguelikeDepthMagic::Coefficient(suffix);
-        for (WORD prefix : data->wPrefix)
-            matches[1] += RoguelikeDepthMagic::ExperienceCoefficient(prefix);
+        const DepthValues matches = RoguelikeDepthMagic::Counts(
+            RoguelikeDepthMagic::kEffects, data->wPrefix, data->wSuffix);
         for (size_t i = 0; i < matches.size(); ++i) {
             if (matches[i] > 1) {
                 error = "duplicate depth affix on one equipped item";
@@ -3981,17 +3978,17 @@ bool SetDepthDeltas(StatList* state, const DepthValues& previous,
     DepthValues original{};
     for (size_t i = 0; i < original.size(); ++i)
         original[i] = D2COMMON_GetStatValueFromStatList(
-            state, RoguelikeDepthMagic::kStats[i], 0);
+            state, RoguelikeDepthMagic::kEffects[i].statId, 0);
     for (size_t i = 0; i < target.size(); ++i) {
         if (previous[i] == target[i]) continue;
         const int next = original[i] - previous[i] + target[i];
-        const unsigned stat = RoguelikeDepthMagic::kStats[i];
+        const unsigned stat = RoguelikeDepthMagic::kEffects[i].statId;
         if (D2COMMON_SetPropertyStat(state, stat, next, 0) &&
             D2COMMON_GetStatValueFromStatList(state, stat, 0) == next) continue;
         bool restored = true;
         for (size_t j = 0; j <= i; ++j) {
             if (previous[j] == target[j]) continue;
-            const unsigned rollbackStat = RoguelikeDepthMagic::kStats[j];
+            const unsigned rollbackStat = RoguelikeDepthMagic::kEffects[j].statId;
             if (!D2COMMON_SetPropertyStat(state, rollbackStat, original[j], 0) ||
                 D2COMMON_GetStatValueFromStatList(state, rollbackStat, 0) != original[j])
                 restored = false;
@@ -4114,7 +4111,9 @@ bool RefreshDepthMagic(void* game, UnitAny* player, std::string& error) {
     }
     DepthValues target{};
     if (!EquippedDepthCoefficients(player, target, error)) return false;
-    for (int& coefficient : target) coefficient *= depth;
+    for (size_t i = 0; i < target.size(); ++i)
+        target[i] = static_cast<int>(RoguelikeDepthMagic::Bonus(
+            RoguelikeDepthMagic::kEffects[i], target[i], depth));
     return ApplyDepthState(game, player, area, target, error);
 }
 bool PrepareZonePlayerState(void* game, UnitAny* player, bool hasMapAffixes,
@@ -9856,15 +9855,18 @@ void RequestDepthMagicPulse() {
             !Readable(player->pInventory, sizeof(Inventory)) ||
             player->pInventory->pOwner != player) return;
         bool equipped = false;
-        for (int slot : {2, 6, 7, 9}) {
+        for (int slot = EQUIP_HEAD; slot <= EQUIP_LEFT_SECONDARY && !equipped; ++slot) {
+            if (!(RoguelikeDepthMagic::kEquipmentSlots & (1u << slot))) continue;
             UnitAny* item = D2COMMON_GetItemByBodyLoc(player->pInventory, slot);
             if (!Readable(item, sizeof(UnitAny)) || item->dwType != UNIT_ITEM ||
                 !Readable(item->pItemData, sizeof(ItemData))) continue;
-            for (WORD suffix : item->pItemData->wSuffix)
-                equipped |= RoguelikeDepthMagic::Coefficient(suffix) != 0;
-            for (WORD prefix : item->pItemData->wPrefix)
-                equipped |= RoguelikeDepthMagic::ExperienceCoefficient(prefix) != 0;
-            if (equipped) break;
+            for (const auto& effect : RoguelikeDepthMagic::kEffects)
+                if ((effect.equipmentSlots & (1u << slot)) &&
+                    RoguelikeDepthMagic::Matches(
+                        effect, item->pItemData->wPrefix, item->pItemData->wSuffix)) {
+                    equipped = true;
+                    break;
+                }
         }
         if (!equipped) return;
     }

@@ -123,21 +123,12 @@ namespace {
     void __stdcall AppendDepthTooltip(UnitAny* item, wchar_t* out, unsigned capacity) {
         if (!item || item->dwType != UNIT_ITEM || !item->pItemData || !out ||
             !capacity || capacity > 4096) return;
-        bool depthSuffix = false;
-        bool depthPrefix = false;
-        for (unsigned i = 0; i < 3; ++i) {
-            depthSuffix |= RoguelikeDepthMagic::Coefficient(item->pItemData->wSuffix[i]) != 0;
-            depthPrefix |= RoguelikeDepthMagic::ExperienceCoefficient(item->pItemData->wPrefix[i]) != 0;
-        }
-        if (!depthSuffix && !depthPrefix) return;
         size_t length = wcsnlen_s(out, capacity);
         if (length == capacity) return;
-        const wchar_t* lines[] = {
-            depthSuffix ? L"+1% Better Chance of Getting Magic Items per Run Depth" : nullptr,
-            depthPrefix ? L"+1% Experience Gained per Run Depth" : nullptr,
-        };
-        for (const wchar_t* line : lines) {
-            if (!line || wcsstr(out, line)) continue;
+        for (const auto& effect : RoguelikeDepthMagic::kEffects) {
+            const wchar_t* line = effect.tooltip;
+            if (!RoguelikeDepthMagic::Matches(effect, item->pItemData->wPrefix,
+                    item->pItemData->wSuffix) || wcsstr(out, line)) continue;
             const size_t lineLength = wcslen(line);
             const bool separator = length && out[length - 1] != L'\n';
             if (lineLength + (separator ? 1 : 0) + 2 > capacity - length) continue;
